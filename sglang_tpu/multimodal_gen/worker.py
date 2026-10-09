@@ -5,7 +5,10 @@
 def install_runtime_patches() -> None:
     """Patch a worker; call after ``torch_tpu`` is imported."""
     from sglang_tpu.multimodal_gen import rope, sdpa_mask
+    from sglang_tpu.patches import _register_aten_fallbacks
 
+    # sglang_tpu's kernels for ATen ops torch_tpu lacks (e.g. logaddexp).
+    _register_aten_fallbacks()
     rope.install()
     sdpa_mask.install()
 
