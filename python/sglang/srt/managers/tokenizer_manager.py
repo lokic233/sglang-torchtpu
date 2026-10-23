@@ -1464,14 +1464,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.positional_embed_overrides is not None
         ):
             return
-        try:
-            min_id, max_id = min(input_ids), max(input_ids)
-        except TypeError:
-            raise ValueError("input_ids must be integers.") from None
-        if not isinstance(min_id, numbers.Integral) or not isinstance(
-            max_id, numbers.Integral
+        # Check every id, not just min/max: [1, 2.5, 3] has integer extremes.
+        # bool is an Integral subclass but never a valid token id.
+        if any(
+            isinstance(token_id, bool) or not isinstance(token_id, numbers.Integral)
+            for token_id in input_ids
         ):
             raise ValueError("input_ids must be integers.")
+        min_id, max_id = min(input_ids), max(input_ids)
         vocab_size = self.model_config.vocab_size
         if min_id < 0 or max_id >= vocab_size:
             bad_id = min_id if min_id < 0 else max_id

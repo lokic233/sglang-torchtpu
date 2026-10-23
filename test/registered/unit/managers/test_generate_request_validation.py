@@ -52,8 +52,12 @@ class TestGenerateRequestValidation(CustomTestCase):
                     self._validate(GenerateReqInput(input_ids=input_ids))
 
     def test_rejects_non_integer_input_ids(self):
-        with self.assertRaisesRegex(ValueError, "input_ids must be integers"):
-            self._validate(GenerateReqInput(input_ids=[1, "2"]))
+        # A non-integer between integer extremes must not slip past a
+        # min/max-only check.
+        for input_ids in ([1, "2"], [1, 2.5, 3], [1, None], [1, True, 3]):
+            with self.subTest(input_ids=input_ids):
+                with self.assertRaisesRegex(ValueError, "input_ids must be integers"):
+                    self._validate(GenerateReqInput(input_ids=input_ids))
 
     def test_text_prompt_ids_are_not_checked_against_vocab(self):
         # Ids produced by the tokenizer or a multimodal processor are trusted;
