@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.common import pd_swa_transfer_window_start
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 PAGE, WINDOW, ROWS = 128, 128, 32768
@@ -21,13 +22,13 @@ class Allocator:
         self.freed.append(indices.clone())
 
 
-def scheduler(swa=True):
+def scheduler(swa=True, window=WINDOW, page=PAGE):
     return NS(
         tree_cache=NS(
             supports_prefix_sharing=lambda: False,
             supports_swa=lambda: swa,
-            sliding_window_size=WINDOW,
-            page_size=PAGE,
+            sliding_window_size=window,
+            page_size=page,
         ),
         req_to_token_pool=NS(
             req_to_token=torch.arange(ROWS, dtype=torch.int64).view(1, ROWS)
@@ -49,9 +50,9 @@ def release(sched, request):
     return sched.token_to_kv_pool_allocator.freed
 
 
-def payload_window_start(seq_len):
+def payload_window_start(seq_len, window=WINDOW, page=PAGE):
     # The SWA payload sent to decode starts at this page boundary.
-    return (max(0, seq_len - WINDOW) // PAGE) * PAGE
+    return pd_swa_transfer_window_start(seq_len, window, page)
 
 
 def test_finished_prefill_keeps_only_the_window():
@@ -71,6 +72,19 @@ def test_partial_page_stops_at_the_payload_boundary():
     freed = release(sched, request)
     assert freed[0].numel() == payload_window_start(16300) == 16128
     assert request.kv.get_evicted_seqlen(ComponentType.SWA) == 16128
+
+
+def test_window_not_a_page_multiple_keeps_the_page_the_payload_starts_in():
+    # gpt-oss: a 127-token window at 64-token pages. For L % 64 == 63 the
+    # payload starts a page before page_floor(L - W); the release must keep it.
+    window, page = 127, 64
+    for seq_len, start in ((16383, 16192), (16384, 16256), (16320, 16192)):
+        sched, request = scheduler(window=window, page=page), req(seq_len)
+        freed = release(sched, request)
+        assert start == payload_window_start(seq_len, window, page)
+        assert len(freed) == 1 and freed[0].tolist() == list(range(start))
+        assert request.kv.get_evicted_seqlen(ComponentType.SWA) == start
+        assert (seq_len // page) * page - start >= window
 
 
 def test_prompt_within_the_window_frees_nothing():
