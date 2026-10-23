@@ -79,10 +79,11 @@ _EntryKey = tuple[int, int]
 def _entry_key(entry: Any) -> _EntryKey:
     # Microseconds are the pybind's native unit. Older torch_tpu wheels report
     # no peak host memory; that leaves the key duration-only.
-    return (
-        entry.compilation_duration // _ONE_MICROSECOND,
-        int(getattr(entry, "peak_compilation_host_memory_bytes", 0) or 0),
-    )
+    try:
+        peak = int(getattr(entry, "peak_compilation_host_memory_bytes", 0) or 0)
+    except (TypeError, ValueError):
+        peak = 0
+    return (entry.compilation_duration // _ONE_MICROSECOND, peak)
 
 
 def _duration_multiset(stats: Any) -> collections.Counter:
@@ -159,7 +160,7 @@ def _format_host_memory(event: RecompileEvent) -> str:
     if event.host_rss_delta_bytes:
         per_program = (
             f", {event.host_rss_delta_bytes / programs / _MIB:.1f} MiB per program"
-            if programs
+            if programs and event.host_rss_delta_bytes > 0
             else ""
         )
         parts.append(
@@ -439,7 +440,7 @@ class RecompilationChecker:
         growth = rss - self._baseline_rss
         per_program = (
             f" ({growth / self.serving_programs / _MIB:.1f} MiB per program)"
-            if self.serving_programs
+            if self.serving_programs and growth > 0
             else ""
         )
         return (

@@ -723,5 +723,339 @@ class TestHostMemoryReport(CustomTestCase):
         self.assertGreater(checker._baseline_rss, 0)
 
 
+def _with_peaks(cache, peaks):
+    """A stats reader that assigns ``peaks`` to the last entries, in order."""
+    orig = cache.read_stats
+
+    def read_stats():
+        stats = orig()
+        for entry, peak in zip(stats.per_entry_stats[-len(peaks) :], peaks):
+            entry.peak_compilation_host_memory_bytes = peak
+        return stats
+
+    return read_stats
+
+
+class TestHostMemoryReportEdgeCases(CustomTestCase):
+    """Degenerate readings must degrade the report, never the forward."""
+
+    _TIB = 1 << 40
+
+    def _event(self, cache, rss, *durations_ms, grow_mib=0.0, peaks=None):
+        checker = _memory_checker(cache, rss)
+        checker.snapshot_baseline()
+        if peaks is not None:
+            checker._read_stats = _with_peaks(cache, peaks)
+        cache.compile(*durations_ms)
+        rss.grow(grow_mib)
+        with self.assertLogs(_LOGGER, level="INFO") as logs:
+            event = checker.check(context_fn=_context)
+        return checker, event, logs.output[0]
+
+    def test_first_event_measures_from_the_baseline_reading(self):
+        cache, rss = _FakeCache([500]), _FakeRss()
+        checker = _memory_checker(cache, rss)
+        checker.snapshot_baseline()
+        self.assertEqual(checker._last_rss, checker._baseline_rss)
+        cache.compile(300)
+        rss.grow(2.0)
+        self.assertEqual(
+            checker.check(context_fn=_context).host_rss_delta_bytes, 2 << 20
+        )
+
+    def test_flat_rss_omits_the_host_part_but_keeps_the_peak(self):
+        _, event, line = self._event(
+            _FakeCache([500]), _FakeRss(), 300, peaks=[5 << 20]
+        )
+        self.assertEqual(event.host_rss_delta_bytes, 0)
+        self.assertNotIn("host RSS", line)
+        self.assertIn("This rank: peak compile host memory 5 MiB.", line)
+
+    def test_shrinking_rss_is_signed_and_has_no_per_program_share(self):
+        _, event, line = self._event(_FakeCache([500]), _FakeRss(), 300, grow_mib=-3.0)
+        self.assertEqual(event.host_rss_delta_bytes, -(3 << 20))
+        self.assertIn("host RSS -3.0 MiB since the previous report", line)
+        self.assertNotIn("per program", line)
+        self.assertIsNotNone(_PARSER_RE.match(line))
+
+    def test_per_program_share_divides_by_compiled_plus_loaded_programs(self):
+        # One compile and one persistent-cache load: 3 MiB over 2 programs.
+        _, event, line = self._event(
+            _FakeCache([500]), _FakeRss(), 300, 0, grow_mib=3.0
+        )
+        self.assertEqual(event.load_count, 1)
+        self.assertIn("1.5 MiB per program", line)
+
+    def test_load_only_event_still_reports_host_memory(self):
+        _, event, line = self._event(_FakeCache([500]), _FakeRss(), 0, grow_mib=4.0)
+        self.assertEqual(event.durations_ms, ())
+        self.assertIn("loaded from the persistent compile cache", line)
+        self.assertIn(
+            "host RSS +4.0 MiB since the previous report, 4.0 MiB per program", line
+        )
+        self.assertIsNone(_PARSER_RE.match(line))
+
+    def test_small_share_rounds_to_one_decimal(self):
+        _, _, line = self._event(_FakeCache([500]), _FakeRss(), 1, 2, 3, grow_mib=1.0)
+        self.assertIn("0.3 MiB per program", line)
+
+    def test_rss_unreadable_at_the_event_keeps_the_last_reading(self):
+        cache, rss = _FakeCache([500]), _FakeRss()
+        checker = _memory_checker(cache, rss)
+        checker.snapshot_baseline()
+        base = rss.bytes
+        rss.bytes = 0  # /proc read failed this time
+        cache.compile(300)
+        self.assertEqual(checker.check(context_fn=_context).host_rss_delta_bytes, 0)
+        self.assertEqual(checker._last_rss, base)
+        rss.bytes = base + (2 << 20)  # readable again: delta from the last good read
+        cache.compile(300)
+        self.assertEqual(
+            checker.check(context_fn=_context).host_rss_delta_bytes, 2 << 20
+        )
+
+    def test_rss_unreadable_at_the_baseline_reports_no_delta_until_two_reads(self):
+        cache, rss = _FakeCache([500]), _FakeRss(bytes_=0)
+        checker = _memory_checker(cache, rss)
+        checker.snapshot_baseline()
+        rss.bytes = 10 << 30
+        cache.compile(300)
+        # First reading after an unreadable baseline: nothing to diff against.
+        self.assertEqual(checker.check(context_fn=_context).host_rss_delta_bytes, 0)
+        rss.grow(1.0)
+        cache.compile(300)
+        self.assertEqual(
+            checker.check(context_fn=_context).host_rss_delta_bytes, 1 << 20
+        )
+
+    def test_baseline_with_an_empty_cache_and_no_rss_logs_zeros(self):
+        checker = _memory_checker(_FakeCache([]), _FakeRss(bytes_=0))
+        with self.assertLogs(_LOGGER, level="INFO") as logs:
+            checker.snapshot_baseline()
+        self.assertIn("0 cached programs, 0.0s total compile time", logs.output[0])
+        self.assertIn("host RSS 0.00 GiB", logs.output[0])
+
+    def test_entries_without_peak_memory_key_on_duration_only(self):
+        cache = _FakeCache([500])
+        for peaks in ([None], []):  # None value, or attribute absent
+            with self.subTest(peaks=peaks):
+                checker, event, line = self._event(
+                    cache, _FakeRss(), 300, peaks=peaks or None
+                )
+                self.assertEqual(event.durations_ms, (300,))
+                self.assertEqual(event.peak_compile_host_bytes, 0)
+                self.assertNotIn("peak compile host memory", line)
+
+    def test_unusable_peak_memory_degrades_to_zero(self):
+        for peak in ("n/a", object(), 3.9, "7"):
+            with self.subTest(peak=peak):
+                _, event, _ = self._event(
+                    _FakeCache([500]), _FakeRss(), 300, peaks=[peak]
+                )
+                self.assertEqual(event.durations_ms, (300,))
+                expected = {3.9: 3, "7": 7}.get(peak, 0)
+                self.assertEqual(event.peak_compile_host_bytes, expected)
+
+    def test_largest_peak_among_the_new_entries_wins(self):
+        _, event, line = self._event(
+            _FakeCache([500]), _FakeRss(), 300, 300, 300, peaks=[9 << 20, 2 << 20, 0]
+        )
+        self.assertEqual(event.peak_compile_host_bytes, 9 << 20)
+        self.assertIn("peak compile host memory 9 MiB", line)
+
+    def test_duplicate_keys_count_every_new_program(self):
+        cache = _FakeCache([500, 500])
+        checker = _memory_checker(cache, _FakeRss())
+        checker._read_stats = _with_peaks(cache, [1 << 20] * 4)
+        checker.snapshot_baseline()
+        cache.compile(500, 500)  # same duration and peak as the baseline pair
+        event = checker.check(context_fn=_context)
+        self.assertEqual(event.durations_ms, (500, 500))
+        self.assertEqual(checker.serving_programs, 2)
+
+    def test_evicted_entry_replaced_by_a_same_key_entry_is_invisible(self):
+        # Documented limit of the multiset identity: no stable entry id upstream.
+        cache = _FakeCache([500])
+        checker = _memory_checker(cache, _FakeRss())
+        checker.snapshot_baseline()
+        cache.misses += 1  # a miss whose entry evicted a same-key one
+        self.assertIsNone(checker.check(context_fn=_context))
+
+    def test_terabyte_values_format_without_overflow(self):
+        rss = _FakeRss(bytes_=self._TIB)
+        checker = _memory_checker(_FakeCache([500]), rss)
+        with self.assertLogs(_LOGGER, level="INFO") as logs:
+            checker.snapshot_baseline()
+        self.assertIn("host RSS 1024.00 GiB", logs.output[0])
+        event = _build_event(
+            new_us=(300_000,),
+            context="c",
+            warn_ms=1000,
+            host_rss_delta_bytes=2 * self._TIB,
+            peak_compile_host_bytes=self._TIB + (self._TIB >> 1),
+        )
+        line = _format_event(event, warn_ms=1000)
+        self.assertIn("host RSS +2097152.0 MiB", line)
+        self.assertIn("peak compile host memory 1572864 MiB", line)
+
+    def test_event_builder_defaults_keep_older_call_sites_working(self):
+        event = _build_event(new_us=(300_000,), context="c", warn_ms=1000)
+        self.assertEqual(
+            (event.host_rss_delta_bytes, event.peak_compile_host_bytes), (0, 0)
+        )
+        self.assertEqual(recompilation_checker._format_host_memory(event), "")
+
+    def test_host_memory_sits_between_the_compile_sentence_and_the_sites(self):
+        event = _build_event(
+            new_us=(300_000,),
+            context="Model EXTEND real=q9,b1 pad=q16,b64",
+            warn_ms=1000,
+            sites=(("aten.add() @ sglang_tpu/x.py:1", 2),),
+            host_rss_delta_bytes=1 << 20,
+            peak_compile_host_bytes=1 << 20,
+        )
+        line = _format_event(event, warn_ms=1000)
+        match = _PARSER_RE.match(line)
+        self.assertEqual(match.group("durations"), "300")
+        self.assertEqual(match.group("context"), event.context)
+        compile_end = line.index("threshold).")
+        host = line.index(" This rank: ")
+        sites = line.index("aten.add()")
+        self.assertLess(compile_end, host)
+        self.assertLess(host, sites)
+        self.assertIn("durations_ms=[300] (total 300 ms", line)
+
+    def test_heavy_line_keeps_its_shape_with_host_memory(self):
+        _, event, line = self._event(
+            _FakeCache([500]), _FakeRss(), 5000, grow_mib=1.0, peaks=[1 << 20]
+        )
+        self.assertTrue(event.heavy)
+        self.assertTrue(line.startswith("WARNING:"))
+        match = _PARSER_RE.match(line)
+        self.assertEqual(match.group("durations"), "5000")
+        self.assertIn("covered by precompile. This rank:", line)
+
+
+class TestHostMemorySummaryEdgeCases(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = patch.object(recompilation_checker, "_SUMMARY_WINDOW_SEC", 60.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.now = [0.0]
+
+    def _checker(self, cache, rss):
+        checker = _memory_checker(cache, rss, clock=lambda: self.now[0])
+        checker.snapshot_baseline()
+        return checker
+
+    def _summary(self, checker):
+        self.now[0] += 61
+        with self.assertLogs(_LOGGER, level="INFO") as logs:
+            checker.check(context_fn=_context)
+        summaries = [line for line in logs.output if "of wall" in line]
+        self.assertEqual(len(summaries), 1)
+        return summaries[0]
+
+    def test_shrinking_rss_since_baseline_has_no_per_program_share(self):
+        cache, rss = _FakeCache([500]), _FakeRss()
+        checker = self._checker(cache, rss)
+        cache.compile(100)
+        rss.grow(-5.0)
+        checker.check(context_fn=_context)
+        summary = self._summary(checker)
+        self.assertIn(
+            "Host RSS of this rank -5 MiB since the baseline for 1 program(s);", summary
+        )
+        self.assertNotIn("per program", summary)
+
+    def test_growth_with_zero_programs_divides_by_nothing(self):
+        # A miss whose entry was evicted counts as a forward with no program.
+        cache, rss = _FakeCache([500]), _FakeRss()
+        checker = self._checker(cache, rss)
+        cache.misses += 1
+        rss.grow(7.0)
+        checker.check(context_fn=_context)
+        # The window closes on a later event, so force one program-less event
+        # into the window via the counters: no programs, but a window event.
+        checker._window_events = 1
+        summary = self._summary(checker)
+        self.assertIn("+7 MiB since the baseline for 0 program(s);", summary)
+        self.assertNotIn("per program", summary)
+
+    def test_unreadable_rss_at_baseline_omits_host_growth(self):
+        cache, rss = _FakeCache([500]), _FakeRss(bytes_=0)
+        checker = self._checker(cache, rss)
+        rss.bytes = 10 << 30
+        cache.compile(100)
+        checker.check(context_fn=_context)
+        summary = self._summary(checker)
+        self.assertIn("of wall", summary)
+        self.assertNotIn("Host RSS", summary)
+
+    def test_rss_becoming_unreadable_omits_host_growth(self):
+        cache, rss = _FakeCache([500]), _FakeRss()
+        checker = self._checker(cache, rss)
+        cache.compile(100)
+        checker.check(context_fn=_context)
+        rss.bytes = 0
+        summary = self._summary(checker)
+        self.assertNotIn("Host RSS", summary)
+        self.assertTrue(summary.endswith("worst 100 ms."))
+
+    def test_rss_growth_without_any_compile_is_not_summarized(self):
+        cache, rss = _FakeCache([500]), _FakeRss()
+        checker = self._checker(cache, rss)
+        rss.grow(100.0)
+        self.now[0] += 61
+        with self.assertNoLogs(_LOGGER, level="INFO"):
+            checker.check(context_fn=_context)
+
+    def test_summary_counts_programs_across_windows(self):
+        cache, rss = _FakeCache([500]), _FakeRss()
+        checker = self._checker(cache, rss)
+        cache.compile(100, 0)
+        rss.grow(2.0)
+        checker.check(context_fn=_context)
+        self._summary(checker)
+        cache.compile(100)
+        rss.grow(1.0)
+        checker.check(context_fn=_context)
+        summary = self._summary(checker)
+        self.assertIn(
+            "+3 MiB since the baseline for 3 program(s) (1.0 MiB per program)", summary
+        )
+
+    def test_rebaseline_resets_the_growth_origin(self):
+        cache, rss = _FakeCache([500]), _FakeRss()
+        checker = self._checker(cache, rss)
+        cache.compile(100)
+        rss.grow(50.0)
+        checker.check(context_fn=_context)
+        checker.snapshot_baseline()  # a later warmup phase
+        cache.compile(100)
+        rss.grow(1.0)
+        event = checker.check(context_fn=_context)
+        self.assertEqual(event.host_rss_delta_bytes, 1 << 20)
+        summary = self._summary(checker)
+        self.assertIn("+1 MiB since the baseline", summary)
+
+
+class TestDisabledChecker(CustomTestCase):
+    def test_opt_out_reads_neither_cache_stats_nor_rss(self):
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
+            patch.object(recompilation_checker, "rss_bytes") as rss,
+            patch.object(
+                recompilation_checker, "_shared_recompilation_checker"
+            ) as shared,
+            self.assertNoLogs(_LOGGER, level="INFO"),
+        ):
+            install_recompilation_checker(policies=(MagicMock(),), model_label="M")
+            snapshot_recompilation_baseline()
+        rss.assert_not_called()
+        shared.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
