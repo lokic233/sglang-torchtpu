@@ -1302,6 +1302,188 @@ class TestGroupFailureDrainGate(unittest.TestCase):
         self.assertTrue(callable(RaidenKVReceiver.quiesce_group_failure))
 
 
+class TestGroupFailureReasonSharing(unittest.TestCase):
+    """A rank that only holds the group-failure placeholder adopts the reason
+    of the rank that failed first, so rank 0's HTTP body carries it (#1664)."""
+
+    REFUSAL = "Raiden push-reshard (prefill attention TP 8 -> decode 2) refused."
+
+    def _gate(self, polls, pollers, groups, gathered_by_leg):
+        """Run the drain gate with the collectives faked for a single process.
+
+        ``gathered_by_leg`` lists, per group leg, what every rank contributed
+        to that leg's all_gather_object: a list of per-room reasons (None for
+        a placeholder). The local rank's contribution is slot 0 and is taken
+        from the live pollers, so the test only supplies the peers' slots."""
+        from sglang.srt.disaggregation.utils import _gate_group_failure_on_drain
+
+        legs = []
+
+        def all_gather_object(out, local, group=None):
+            peers = gathered_by_leg[len(legs)]
+            legs.append((group, list(local)))
+            out[:] = [local, *peers]
+
+        with patch("sglang.srt.disaggregation.utils.dist") as dist:
+            dist.all_reduce = lambda t, op=None, group=None: None
+            dist.get_world_size = lambda group: 1 + len(gathered_by_leg[0])
+            dist.all_gather_object = all_gather_object
+            result = _gate_group_failure_on_drain(polls, pollers, groups)
+        return result, legs
+
+    def _lagging_receiver(self):
+        """A decode receiver whose rank has not failed the room itself."""
+        mgr = _decode_manager_stub()
+        mgr._fail_room_unless_failed_locked = types.MethodType(
+            RaidenKVManager._fail_room_unless_failed_locked, mgr
+        )
+        mgr._fail_room_locked = types.MethodType(RaidenKVManager._fail_room_locked, mgr)
+        mgr._is_failed_locked = lambda room: str(room) in mgr._failed
+        mgr._prefill = None
+        recv = _receiver(mgr)
+        recv._send_abort_notification = lambda: None
+        return mgr, recv
+
+    def test_rank_without_its_own_failure_adopts_the_peer_reason(self):
+        mgr, recv = self._lagging_receiver()
+
+        polls, legs = self._gate(
+            [KVPoll.Failed], [recv], [object()], [[[self.REFUSAL]]]
+        )
+
+        self.assertEqual(polls, [KVPoll.Failed])
+        # The local leg carried the placeholder as "no reason of my own".
+        self.assertEqual([local for _, local in legs], [[None]])
+        self.assertEqual(mgr.failure_records[ROOM], self.REFUSAL)
+        with self.assertRaises(KVTransferError) as cm:
+            recv.failure_exception()
+        self.assertEqual(cm.exception.failure_reason, self.REFUSAL)
+        self.assertTrue(cm.exception.is_from_another_rank)
+
+    def test_originating_rank_keeps_its_reason_and_is_not_propagated(self):
+        mgr, recv = self._lagging_receiver()
+        recv._conclude_failed(reason=self.REFUSAL)
+
+        polls, legs = self._gate([KVPoll.Failed], [recv], [object()], [[[None]]])
+
+        self.assertEqual(polls, [KVPoll.Failed])
+        self.assertEqual([local for _, local in legs], [[self.REFUSAL]])
+        self.assertEqual(mgr.failure_records[ROOM], self.REFUSAL)
+        with self.assertRaises(KVTransferError) as cm:
+            recv.failure_exception()
+        self.assertEqual(cm.exception.failure_reason, self.REFUSAL)
+        self.assertFalse(cm.exception.is_from_another_rank)
+
+    def test_first_originating_reason_in_rank_order_wins(self):
+        mgr, recv = self._lagging_receiver()
+
+        self._gate(
+            [KVPoll.Failed],
+            [recv],
+            [object()],
+            [[[None], ["rank 2 failed later"], ["rank 3 failed later"]]],
+        )
+
+        self.assertEqual(mgr.failure_records[ROOM], "rank 2 failed later")
+
+    def test_reason_crosses_tp_then_cp_legs(self):
+        mgr, recv = self._lagging_receiver()
+        tp_group, cp_group = object(), object()
+
+        polls, legs = self._gate(
+            [KVPoll.Failed],
+            [recv],
+            [tp_group, cp_group],
+            # TP peer has nothing; the CP peer's TP group failed the room.
+            [[[None]], [[self.REFUSAL]]],
+        )
+
+        self.assertEqual(polls, [KVPoll.Failed])
+        self.assertEqual(
+            legs, [(tp_group, [None]), (cp_group, [None])]
+        )  # the second leg carries the first leg's (empty) verdict
+        self.assertEqual(mgr.failure_records[ROOM], self.REFUSAL)
+
+    def test_only_gated_rooms_exchange_reasons(self):
+        mgr, recv = self._lagging_receiver()
+        other = SimpleNamespace(
+            group_failure_requires_drain=True,
+            quiesce_group_failure=Mock(),
+            drained=lambda: True,
+            group_failure_reason=Mock(),
+            adopt_group_failure_reason=Mock(),
+        )
+
+        self._gate(
+            [KVPoll.Transferring, KVPoll.Failed],
+            [other, recv],
+            [object()],
+            [[[self.REFUSAL]]],
+        )
+
+        other.group_failure_reason.assert_not_called()
+        other.adopt_group_failure_reason.assert_not_called()
+        self.assertEqual(mgr.failure_records[ROOM], self.REFUSAL)
+
+    def test_backend_without_the_hooks_runs_no_gather(self):
+        poller = SimpleNamespace(
+            group_failure_requires_drain=True,
+            quiesce_group_failure=Mock(),
+            drained=lambda: True,
+        )
+
+        polls, legs = self._gate([KVPoll.Failed], [poller], [object()], [[[None]]])
+
+        self.assertEqual(polls, [KVPoll.Failed])
+        self.assertEqual(legs, [])
+
+    def test_placeholder_alone_is_reported_as_propagated(self):
+        mgr, recv = self._lagging_receiver()
+        recv.quiesce_group_failure()
+
+        with self.assertRaises(KVTransferError) as cm:
+            recv.failure_exception()
+        self.assertTrue(cm.exception.is_from_another_rank)
+        self.assertIn("another attention TP/CP rank", cm.exception.failure_reason)
+
+    def test_adoption_never_recreates_a_cleared_record(self):
+        mgr, recv = self._lagging_receiver()
+
+        recv.adopt_group_failure_reason(self.REFUSAL)
+
+        self.assertNotIn(ROOM, mgr.failure_records)
+        self.assertFalse(getattr(recv, "_reason_from_another_rank", False))
+
+    def test_sender_adopts_the_peer_reason(self):
+        mgr = _gate_manager()
+        sender = _gate_sender(mgr, ROOM)
+        sender.quiesce_group_failure()
+        self.assertIsNone(sender.group_failure_reason())
+
+        sender.adopt_group_failure_reason(self.REFUSAL)
+
+        self.assertEqual(sender.group_failure_reason(), self.REFUSAL)
+        with self.assertRaises(KVTransferError) as cm:
+            sender.failure_exception()
+        self.assertEqual(cm.exception.failure_reason, self.REFUSAL)
+        self.assertTrue(cm.exception.is_from_another_rank)
+
+    def test_sender_with_its_own_reason_refuses_adoption(self):
+        mgr = _gate_manager()
+        sender = _gate_sender(mgr, ROOM)
+        with mgr._state_lock:
+            mgr._fail_room_locked(ROOM, "Aborted by AbortReq.")
+        sender.quiesce_group_failure()
+
+        sender.adopt_group_failure_reason(self.REFUSAL)
+
+        self.assertEqual(sender.group_failure_reason(), "Aborted by AbortReq.")
+        with self.assertRaises(KVTransferError) as cm:
+            sender.failure_exception()
+        self.assertEqual(cm.exception.failure_reason, "Aborted by AbortReq.")
+        self.assertFalse(cm.exception.is_from_another_rank)
+
+
 class TestGroupFailureQuiescesRaiden(unittest.TestCase):
     def test_sender_tombstones_and_retains_accepted_read_lease(self):
         mgr = _prefill_manager()
