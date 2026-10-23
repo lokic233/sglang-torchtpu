@@ -569,5 +569,159 @@ class TestSiteTracing(CustomTestCase):
             checker.enable_site_tracing.assert_not_called()
 
 
+class _FakeRss:
+    """Stand-in for this rank's /proc RSS reader."""
+
+    def __init__(self, bytes_=10 * (1 << 30)):
+        self.bytes = bytes_
+
+    def read(self):
+        return self.bytes
+
+    def grow(self, mib):
+        self.bytes += int(mib * (1 << 20))
+
+
+def _memory_checker(cache, rss, clock=None):
+    kwargs = {} if clock is None else {"clock": clock}
+    return RecompilationChecker(
+        read_misses=cache.read_misses,
+        read_stats=cache.read_stats,
+        sync_device=cache.sync,
+        warn_ms=1000,
+        read_rss=rss.read,
+        **kwargs,
+    )
+
+
+class TestHostMemoryReport(CustomTestCase):
+    """Issue #1429: each rank's executables cost host RAM once per rank."""
+
+    def test_baseline_logs_this_ranks_rss(self):
+        cache = _FakeCache([500])
+        rss = _FakeRss(bytes_=int(2.5 * (1 << 30)))
+        checker = _memory_checker(cache, rss)
+        with self.assertLogs(_LOGGER, level="INFO") as logs:
+            checker.snapshot_baseline()
+        self.assertIn("host RSS 2.50 GiB (this rank", logs.output[0])
+
+    def test_event_reports_rss_growth_per_new_program(self):
+        cache = _FakeCache([500])
+        rss = _FakeRss()
+        checker = _memory_checker(cache, rss)
+        checker.snapshot_baseline()
+        cache.compile(300, 300)
+        rss.grow(1.0)  # two new programs, 0.5 MiB each on this rank
+        with self.assertLogs(_LOGGER, level="INFO") as logs:
+            event = checker.check(context_fn=_context)
+        self.assertEqual(event.host_rss_delta_bytes, 1 << 20)
+        line = logs.output[0]
+        self.assertIn("host RSS +1.0 MiB since the previous report", line)
+        self.assertIn("0.5 MiB per program", line)
+        self.assertIn("Each TP rank process holds its own copy", line)
+        # The compile line keeps the shape log-based checks parse.
+        self.assertIsNotNone(_PARSER_RE.match(line))
+
+    def test_rss_delta_spans_the_forwards_since_the_previous_report(self):
+        cache = _FakeCache([500])
+        rss = _FakeRss()
+        checker = _memory_checker(cache, rss)
+        checker.snapshot_baseline()
+        rss.grow(3.0)  # growth with no compile is charged to the next event
+        for _ in range(5):
+            checker.check(context_fn=_context)
+        cache.compile(300)
+        rss.grow(1.0)
+        event = checker.check(context_fn=_context)
+        self.assertEqual(event.host_rss_delta_bytes, 4 << 20)
+        # A second event measures from the first, not from the baseline.
+        cache.compile(300)
+        rss.grow(2.0)
+        self.assertEqual(
+            checker.check(context_fn=_context).host_rss_delta_bytes, 2 << 20
+        )
+
+    def test_unreadable_rss_leaves_the_line_unchanged(self):
+        cache = _FakeCache([500])
+        checker = _memory_checker(cache, _FakeRss(bytes_=0))
+        checker.snapshot_baseline()
+        cache.compile(300)
+        with self.assertLogs(_LOGGER, level="INFO") as logs:
+            event = checker.check(context_fn=_context)
+        self.assertEqual(event.host_rss_delta_bytes, 0)
+        self.assertNotIn("host RSS", logs.output[0])
+        self.assertNotIn("This rank", logs.output[0])
+
+    def test_peak_compile_host_memory_of_new_entries_is_reported(self):
+        cache = _FakeCache([500])
+        rss = _FakeRss()
+        checker = _memory_checker(cache, rss)
+        checker.snapshot_baseline()
+
+        def read_stats():
+            stats = cache.read_stats()
+            peaks = [0] * (len(stats.per_entry_stats) - 2) + [3 << 20, 7 << 20]
+            for entry, peak in zip(stats.per_entry_stats, peaks):
+                entry.peak_compilation_host_memory_bytes = peak
+            return stats
+
+        checker._read_stats = read_stats
+        cache.compile(300, 300)
+        with self.assertLogs(_LOGGER, level="INFO") as logs:
+            event = checker.check(context_fn=_context)
+        self.assertEqual(event.peak_compile_host_bytes, 7 << 20)
+        self.assertIn("peak compile host memory 7 MiB", logs.output[0])
+
+    def test_entries_differing_only_in_peak_memory_are_distinct_programs(self):
+        cache = _FakeCache([500])
+        checker = _memory_checker(cache, _FakeRss())
+        checker.snapshot_baseline()
+        # A new program with the same duration as a cached one is only
+        # distinguishable by its peak host memory.
+        cache.compile(500)
+        orig = cache.read_stats
+
+        def read_stats():
+            stats = orig()
+            stats.per_entry_stats[-1].peak_compilation_host_memory_bytes = 1 << 20
+            return stats
+
+        checker._read_stats = read_stats
+        event = checker.check(context_fn=_context)
+        self.assertEqual(event.durations_ms, (500,))
+
+    def test_window_summary_reports_growth_since_baseline_per_program(self):
+        now = [0.0]
+        cache = _FakeCache([500])
+        rss = _FakeRss()
+        checker = _memory_checker(cache, rss, clock=lambda: now[0])
+        with patch.object(recompilation_checker, "_SUMMARY_WINDOW_SEC", 60.0):
+            checker.snapshot_baseline()
+            for _ in range(4):
+                now[0] += 10
+                cache.compile(100)
+                cache.misses += 1  # one program loaded from the persistent cache
+                cache.durations_ms.append(0)
+                rss.grow(2.0)
+                checker.check(context_fn=_context)
+            now[0] += 30
+            with self.assertLogs(_LOGGER, level="INFO") as logs:
+                checker.check(context_fn=_context)
+        summaries = [line for line in logs.output if "of wall" in line]
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(checker.serving_programs, 8)
+        self.assertIn(
+            "Host RSS of this rank +8 MiB since the baseline for 8 program(s) "
+            "(1.0 MiB per program)",
+            summaries[0],
+        )
+
+    def test_default_rss_reader_reads_this_process(self):
+        cache = _FakeCache([500])
+        checker = _checker(cache)
+        checker.snapshot_baseline()
+        self.assertGreater(checker._baseline_rss, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
