@@ -17,6 +17,10 @@ EnvField._allow_set_name = True
 
 
 class TpuEnvs:
+    # Opt-in, request-tagged benchmark admission (benchmark_pd_gate.py).
+    # Zero preserves ordinary P/D scheduling, including continuous batching.
+    SGLANG_TPU_BENCHMARK_PD_BATCH_SIZE = EnvInt(0)
+    SGLANG_TPU_BENCHMARK_PD_TIMEOUT_SEC = EnvFloat(600.0)
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
