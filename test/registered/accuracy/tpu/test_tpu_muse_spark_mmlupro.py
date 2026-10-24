@@ -2,6 +2,7 @@
 
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tpu import MUSE_SPARK, make_model_config
@@ -49,4 +50,6 @@ class TestMuseSparkMMLUPro(AccuracyTestCase, CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    # One pass gives an interpretable prediction archive for a floor failure.
+    with envs.SGLANG_TEST_MAX_RETRY.override(0):
+        unittest.main()
