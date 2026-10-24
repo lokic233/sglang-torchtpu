@@ -259,6 +259,72 @@ assert processors[0].__module__ == "sglang_tpu.multimodal.muse_spark_processor",
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class TestLMEvalPredictionArchive(CustomTestCase):
+    def test_failed_gate_retains_raw_and_filtered_predictions(self):
+        import base64
+        import io
+        import tarfile
+        import tempfile
+        from contextlib import redirect_stdout
+
+        import numpy as np
+
+        from sglang.test.tpu.evals.eval_support import _LMEvalHarness, lm_eval_runner
+
+        results = {
+            "results": {"mmlu_pro": {"exact_match,custom-extract": np.float64(0.71)}},
+            "samples": {
+                "mmlu_pro_biology": [
+                    {
+                        "doc_id": 0,
+                        "target": "A",
+                        "resps": [[""]],
+                        "filtered_resps": ["[invalid]"],
+                        "exact_match": np.int64(0),
+                    }
+                ]
+            },
+        }
+        config = {
+            "model_name": "muse-test",
+            "archive_predictions": True,
+            "rtol": 0.0,
+            "atol": 0.1,
+            "tasks": [
+                {
+                    "name": "mmlu_pro",
+                    "metrics": [{"name": "exact_match,custom-extract", "value": 0.85}],
+                }
+            ],
+        }
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps(config))
+            with (
+                patch.object(_LMEvalHarness, "launch_lm_eval", return_value=results),
+                patch("requests.get"),
+                redirect_stdout(output),
+            ):
+                result = lm_eval_runner(str(path))("http://unused")
+        self.assertFalse(result["_passed"])
+        chunks = [
+            line.split(" ", 1)[1]
+            for line in output.getvalue().splitlines()
+            if line.startswith("FULL_EVAL_ARCHIVE_CHUNK ")
+        ]
+        with tarfile.open(
+            fileobj=io.BytesIO(base64.b64decode("".join(chunks))), mode="r:gz"
+        ) as archive:
+            saved = json.load(archive.extractfile("results.json"))
+            saved_config = json.load(archive.extractfile("config.json"))
+        self.assertEqual(saved_config, config)
+        self.assertEqual(saved["samples"], results["samples"])
+        self.assertEqual(
+            saved["results"]["mmlu_pro"]["exact_match,custom-extract"], 0.71
+        )
+
+
 class TestMuseSparkPDRecipes(CustomTestCase):
     """P/D role recipes must retain each slice's distributed rendezvous."""
 

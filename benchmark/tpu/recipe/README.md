@@ -119,8 +119,11 @@ questions). Only the MMMU-Pro recipe enables the vision tower. The checkpoint
 must be staged at `/weights/Muse-Spark-Open-816B-A42B-NVFP4`. GPQA's reference
 is the [model card](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B),
 and GSM8K's is the TPU first-100 low-effort result. The initial AIME, MMLU-Pro,
-and MMMU-Pro references still need TPU calibration. Individual AIME and
-MMMU-Pro reruns select `model=muse-spark-aime` or `model=muse-spark-mmmupro`.
+and MMMU-Pro references still need TPU calibration. Individual benchmarks select `model=muse-spark-aime`,
+`model=muse-spark-gpqa`, `model=muse-spark-gsm8k`,
+`model=muse-spark-mmlupro`, or `model=muse-spark-mmmupro`. The full selection
+runs at most three benchmarks concurrently. MMLU-Pro retains raw and filtered
+predictions in CI log archives, including when its gate fails.
 
 The Muse P/D gates need two two-host slices and the draft checkpoint at
 `/weights/Muse-Spark-Open-DFlash2`. Both require real DFlash acceptance and a

@@ -317,6 +317,7 @@ def lm_eval_runner(config_path: str, report_only: bool = False):
 
     The YAML owns the task protocol and API model arguments. Thresholds are applied
     unless ``report_only`` is set, in which case the runner returns the raw score.
+    The YAML's ``archive_predictions`` flag retains raw predictions in CI logs.
     """
 
     def run(base_url: str) -> dict[str, Any]:
@@ -344,6 +345,22 @@ def lm_eval_runner(config_path: str, report_only: bool = False):
                 results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
         else:
             results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
+
+        if cfg.get("archive_predictions", False):
+            from lm_eval.utils import handle_non_serializable
+
+            from sglang.test.tpu.evals.full_eval_artifacts import archive_results
+
+            if not results.get("samples"):
+                raise RuntimeError("Prediction archive requires lm-eval samples")
+            output = Path(tempfile.mkdtemp(prefix="lm-eval-results-"))
+            for name, payload in (("config", cfg), ("results", results)):
+                (output / f"{name}.json").write_text(
+                    json.dumps(payload, default=handle_non_serializable),
+                    encoding="utf-8",
+                )
+            # Emit before grading, so failed gates retain their raw answers.
+            archive_results(output)
 
         # Threshold fields are ignored when this runner is report-only.
         rtol = cfg.get("rtol", LMEvalMixin.default_rtol)

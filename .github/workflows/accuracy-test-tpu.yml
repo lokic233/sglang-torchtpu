@@ -34,7 +34,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, muse-spark, muse-spark-aime, muse-spark-mmmupro, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b, qwen3-8-27b, glm-5-3-flash]
+        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, muse-spark, muse-spark-aime, muse-spark-gpqa, muse-spark-gsm8k, muse-spark-mmlupro, muse-spark-mmmupro, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b, qwen3-8-27b, glm-5-3-flash]
       test_filter:
         description: "Substring of a multihost test file path; runs only matching tests"
         required: false
@@ -158,68 +158,41 @@ jobs:
     needs: [build, plan]
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","muse-spark"]'), needs.plan.outputs.model) }}
+          && contains(fromJSON('["all","full-set","day-10am","muse-spark","muse-spark-aime","muse-spark-gpqa","muse-spark-gsm8k","muse-spark-mmlupro","muse-spark-mmmupro"]'), needs.plan.outputs.model) }}
     strategy:
       fail-fast: false
+      # The current nightly pool has three single-host slices. Queue later
+      # benchmarks in Actions so they retain their full TPU admission budget.
+      max-parallel: 3
       matrix:
         include:
-          - suite: nightly-tpu-accuracy-muse-spark-gpqa
+          - benchmark: aime
+            suite: nightly-tpu-accuracy-muse-spark-aime
+            run_name: accuracy-muse-spark-aime
+          - benchmark: gpqa
+            suite: nightly-tpu-accuracy-muse-spark-gpqa
             run_name: accuracy-muse-spark-gpqa
-          - suite: nightly-tpu-accuracy-muse-spark-gsm8k
+          - benchmark: gsm8k
+            suite: nightly-tpu-accuracy-muse-spark-gsm8k
             run_name: accuracy-muse-spark-gsm8k
-          - suite: nightly-tpu-accuracy-muse-spark-mmlupro
+          - benchmark: mmlupro
+            suite: nightly-tpu-accuracy-muse-spark-mmlupro
             run_name: accuracy-muse-spark-mmlupro
+          - benchmark: mmmupro
+            suite: nightly-tpu-accuracy-muse-spark-mmmupro
+            run_name: accuracy-muse-spark-mmmupro
     name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
+      enabled: >-
+        ${{ contains(fromJSON('["all","full-set","day-10am","muse-spark"]'), needs.plan.outputs.model)
+            || needs.plan.outputs.model == format('muse-spark-{0}', matrix.benchmark) }}
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
       lane: nightly
       hosts: 1
       suite: ${{ matrix.suite }}
       run_name: ${{ matrix.run_name }}
-      nightly: true
-      weights_pvc: model-weights
-      timeout_per_file: 14400
-    permissions:
-      contents: read
-      id-token: write
-
-  # Permit a queued AIME retry while the other model evaluations are running.
-  accuracy-muse-spark-aime:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","muse-spark","muse-spark-aime"]'), needs.plan.outputs.model) }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: nightly-tpu-accuracy-muse-spark-aime
-      run_name: accuracy-muse-spark-aime
-      nightly: true
-      weights_pvc: model-weights
-      timeout_per_file: 14400
-    permissions:
-      contents: read
-      id-token: write
-
-  # Keep multimodal accuracy selectable independently of the four text evals.
-  accuracy-muse-spark-mmmupro:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","muse-spark","muse-spark-mmmupro"]'), needs.plan.outputs.model) }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: nightly-tpu-accuracy-muse-spark-mmmupro
-      run_name: accuracy-muse-spark-mmmupro
       nightly: true
       weights_pvc: model-weights
       timeout_per_file: 14400
