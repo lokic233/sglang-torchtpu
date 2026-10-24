@@ -222,6 +222,43 @@ class TestAccuracyRecipes(unittest.TestCase):
         self.assertEqual(declared, set(self.MULTIHOST))
 
 
+class TestMuseSparkMultimodalRecipe(CustomTestCase):
+    """The tokenizer must resolve Muse's native model before any worker starts."""
+
+    def test_multimodal_recipe_registers_native_tokenizer_model(self):
+        import subprocess
+
+        recipe = "recipe/configs/muse_spark/accuracy_mmmupro.py"
+        plan = plan_launch(load_recipe(recipe), inherited=os.environ)
+        # Reproduce tokenizer registration in a fresh process. Importing the
+        # model in this test's interpreter would hide the missing recipe env.
+        script = """
+from sglang.srt.environ import envs
+from sglang.srt.managers.multimodal_processor import PROCESSOR_MAPPING, import_processors
+from sglang.srt.models.registry import ModelRegistry
+
+package = envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get()
+if package:
+    import_processors(package, overwrite=True)
+arch = "MuseSparkForConditionalGeneration"
+assert ModelRegistry.is_arch_supported(arch), "tokenizer cannot resolve native Muse model"
+model, _ = ModelRegistry.resolve_model_cls(arch)
+assert model.__module__ == "sglang_tpu.models.muse_spark_omni", model
+processors = [p for m, p in PROCESSOR_MAPPING.items() if m.__name__ == arch]
+assert len(processors) == 1, processors
+assert processors[0].__module__ == "sglang_tpu.multimodal.muse_spark_processor", processors
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env=plan.env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class TestMuseSparkPDRecipes(CustomTestCase):
     """P/D role recipes must retain each slice's distributed rendezvous."""
 
