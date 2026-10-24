@@ -34,7 +34,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, muse-spark, muse-spark-mmmupro, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b, qwen3-8-27b, glm-5-3-flash]
+        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, muse-spark, muse-spark-mmmupro, muse-spark-status, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b, qwen3-8-27b, glm-5-3-flash]
       test_filter:
         description: "Substring of a multihost test file path; runs only matching tests"
         required: false
@@ -102,13 +102,67 @@ jobs:
   # Standalone runs build their own image; the nightly passes one in so every
   # stage of the run tests a single build.
   build:
-    if: ${{ (inputs.image || '') == '' }}
+    if: ${{ (inputs.image || '') == '' && inputs.model != 'muse-spark-status' }}
     uses: ./.github/workflows/_tpu-build.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
     permissions:
       contents: read
       id-token: write
+
+  muse-spark-status:
+    if: ${{ inputs.model == 'muse-spark-status' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
+      CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: tpu-cluster
+          location: us-central1-c
+      - name: Inspect active Muse test JobSets and pod logs
+        run: |
+          python3 - <<'PY_DIAG'
+          import json
+          import subprocess
+
+          def read(*args):
+              result = subprocess.run(
+                  ["kubectl", "-n", "tpu-ci", *args],
+                  capture_output=True, text=True, timeout=60, check=True,
+              )
+              return result.stdout
+
+          resources = json.loads(read("get", "jobsets", "-o", "json"))
+          prefixes = ("tpu-ci-accuracy-muse-spark-", "tpu-ci-pd-mh-muse-dflash-")
+          for item in resources["items"]:
+              name = item["metadata"]["name"]
+              if not name.startswith(prefixes):
+                  continue
+              print("JOBSET", name, json.dumps(item.get("status", {})), flush=True)
+              uid = item["metadata"]["uid"]
+              workloads = json.loads(read("get", "workloads", "-l", f"kueue.x-k8s.io/job-uid={uid}", "-o", "json"))
+              for workload in workloads["items"]:
+                  print("WORKLOAD", workload["metadata"]["name"], json.dumps(workload.get("status", {})), flush=True)
+              pods = json.loads(read("get", "pods", "-l", f"jobset.sigs.k8s.io/jobset-name={name}", "-o", "json"))
+              for pod in pods["items"]:
+                  pod_name = pod["metadata"]["name"]
+                  status = pod.get("status", {})
+                  print("POD", pod_name, json.dumps({k: status.get(k) for k in ("phase", "conditions", "containerStatuses")}), flush=True)
+                  if status.get("phase") in ("Running", "Succeeded", "Failed"):
+                      print("POD_LOG", pod_name, flush=True)
+                      print(read("logs", pod_name, "-c", "test", "--tail=200", "--timestamps"), flush=True)
+          PY_DIAG
 
   accuracy:
     needs: [build, plan]
