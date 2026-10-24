@@ -258,6 +258,17 @@ class TestFullMMMUCollection(CustomTestCase):
             self.collector.add_summary(groups, conflicting)
         self.assertTrue(groups[("muse", "")]["invalid"])
 
+    def test_partial_rerun_keeps_other_passes_and_latest_failure(self):
+        jobs = [
+            {"id": 900, "name": "shard0", "run_attempt": 1, "conclusion": "success"},
+            {"id": 901, "name": "shard1", "run_attempt": 1, "conclusion": "success"},
+            {"id": 100, "name": "shard0", "run_attempt": 2, "conclusion": "failure"},
+        ]
+        selected = {job["name"]: job for job in self.collector.latest_jobs(jobs)}
+        self.assertEqual(selected["shard0"]["id"], 100)
+        self.assertEqual(selected["shard0"]["conclusion"], "failure")
+        self.assertEqual(selected["shard1"]["id"], 901)
+
     def test_collector_emits_full_identity_and_retains_mmlu_predictions(self):
         import io
         import os

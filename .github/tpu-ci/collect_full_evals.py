@@ -59,6 +59,17 @@ def is_shard_job(job):
     return "mmmu_shard" in job["name"] or "mmmupro-shard" in job["name"]
 
 
+def latest_jobs(jobs):
+    """Keep earlier successful legs when GitHub reruns only part of a matrix."""
+    selected = {}
+    for job in jobs:
+        previous = selected.get(job["name"])
+        rank = (job.get("run_attempt", 1), job["id"])
+        if previous is None or rank > (previous.get("run_attempt", 1), previous["id"]):
+            selected[job["name"]] = job
+    return list(selected.values())
+
+
 def main():
     repo, run_id = os.environ["GH_REPO"], os.environ["RUN_ID"]
     data = subprocess.check_output(
@@ -67,14 +78,15 @@ def main():
             "api",
             "--paginate",
             "--slurp",
-            f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100",
+            f"repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100",
         ],
         text=True,
     )
     jobs = [
         job
-        for page in json.loads(data)
-        for job in page["jobs"]
+        for job in latest_jobs(
+            [job for page in json.loads(data) for job in page["jobs"]]
+        )
         if job.get("conclusion") != "skipped"
     ]
     groups, errors = {}, []
