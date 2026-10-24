@@ -32,10 +32,15 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang_tpu.experimental.compilation.block_compile_policy import block_draft_width
 from sglang_tpu.experimental.models.dflash2 import (
+    build_lattice,
+)
+from sglang_tpu.experimental.models.dflash2 import (
     sample_drafts as sample_dflash2_drafts,
 )
 from sglang_tpu.experimental.speculative.block_draft_worker import (
+    DraftLattice,
     DraftSampler,
+    DraftSampling,
     TpuBlockDraftWorker,
 )
 
@@ -79,18 +84,25 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
         *,
         block_hidden: torch.Tensor,
         bonus_tokens: torch.Tensor,
+        draft_lattice: DraftLattice | None,
         sampler: DraftSampler,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Row 0 is the root; draft_hidden[:, j - 1] predicts d_j at position n + j.
         lm_head = self._dflash_model.lm_head
         assert lm_head is not None
         if isinstance(self._dflash_model, DFlash2DraftModel):
+            if not isinstance(sampler, DraftSampling):
+                raise TypeError(
+                    "DFlash2 walks its lattice in one program; pass DraftSampling"
+                )
+            if draft_lattice is None:
+                raise ValueError("DFlash2 samples from the draft graph's lattice")
             return sample_dflash2_drafts(
-                draft_model=self._dflash_model,
-                draft_hidden=block_hidden[:, 1:],
-                anchor_tokens=bonus_tokens,
+                draft_lattice=draft_lattice,
                 vocab_size=int(lm_head.org_vocab_size),
-                sampler=sampler,
+                temperatures=sampler.temperatures,
+                top_ks=sampler.top_ks,
+                sync=sampler.sync,
             )
         bs = block_hidden.shape[0]
         draft_hidden = block_hidden[:, 1:].reshape(bs * self.num_drafts, -1)
@@ -102,6 +114,15 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
             [sampler(draft_logits[:, j], j) for j in range(self.num_drafts)], dim=1
         )
         return draft_tokens, draft_logits
+
+    def warmup_draft_lattice(
+        self, *, block_hidden: torch.Tensor, bonus_tokens: torch.Tensor
+    ) -> DraftLattice | None:
+        if not isinstance(self._dflash_model, DFlash2DraftModel):
+            return None
+        # Eager, warmup only: the same build_lattice the draft graph traces.
+        with torch.no_grad():
+            return build_lattice(self._dflash_model, block_hidden[:, 1:], bonus_tokens)
 
 
 def _check_supported(

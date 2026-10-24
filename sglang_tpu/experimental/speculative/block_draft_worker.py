@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import abstractmethod
 from collections.abc import Callable
 
+import msgspec
 import torch
 
 from sglang.srt.models.dflash import DFlashDraftModel
@@ -13,10 +14,33 @@ from sglang_tpu.experimental.compilation.block_compile_policy import (
     TpuBlockSpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
+from sglang_tpu.experimental.speculative.spec_ops import sample_tokens
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 # (step_logits [pbs, V], step_idx) -> sampled [pbs] tokens.
 DraftSampler = Callable[[torch.Tensor, int], torch.Tensor]
+# The draft graph's LogitsProcessorOutput.next_draft_lattice.
+DraftLattice = tuple[torch.Tensor, torch.Tensor]
+
+
+class DraftSampling(msgspec.Struct, frozen=True):
+    """Per-row draft sampling params and the TP sync of sampled drafts.
+
+    Called as a DraftSampler it samples one dense step; DFlash2 reads the fields to walk
+    its whole lattice in one compiled program instead.
+    """
+
+    temperatures: torch.Tensor
+    top_ks: torch.Tensor
+    sync: Callable[[torch.Tensor], torch.Tensor]
+
+    def __call__(self, step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+        del step_idx
+        return self.sync(
+            sample_tokens(
+                logits=step_logits, temperatures=self.temperatures, top_ks=self.top_ks
+            )
+        )
 
 
 class TpuBlockDraftWorker(TpuDraftWorker):
@@ -40,6 +64,7 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         *,
         block_hidden: torch.Tensor,
         bonus_tokens: torch.Tensor,
+        draft_lattice: DraftLattice | None,
         sampler: DraftSampler,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sampled [pbs, gamma] drafts and the [pbs, gamma, V] logits q was drawn from.
@@ -47,6 +72,13 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         block_hidden is the [pbs, block_width, H] draft block output. The greedy
         drafts come from the draft graph itself (sample_draft_tokens_tpu).
         """
+
+    def warmup_draft_lattice(
+        self, *, block_hidden: torch.Tensor, bonus_tokens: torch.Tensor
+    ) -> DraftLattice | None:
+        """Stand-in for the draft graph's lattice when warmup samples a synthetic block."""
+        del block_hidden, bonus_tokens
+        return None
 
     def precompile_draft(self) -> None:
         self._compile_policy().precompile_draft(

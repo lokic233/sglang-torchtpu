@@ -12,6 +12,8 @@ extend: target forward on new prompt tokens, inject every row's target feature
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
@@ -40,7 +42,11 @@ from sglang_tpu.compilation.recompilation_checker import (
 from sglang_tpu.experimental.speculative.base_spec_worker import (
     TpuSpecWorker,
 )
-from sglang_tpu.experimental.speculative.block_draft_worker import TpuBlockDraftWorker
+from sglang_tpu.experimental.speculative.block_draft_worker import (
+    DraftLattice,
+    DraftSampling,
+    TpuBlockDraftWorker,
+)
 from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
 from sglang_tpu.experimental.speculative.dflash.dflash_draft_worker import (
     TpuDflashDraftWorker,
@@ -49,10 +55,7 @@ from sglang_tpu.experimental.speculative.draft_forward import forward_draft_rows
 from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
-from sglang_tpu.experimental.speculative.spec_ops import (
-    build_draft_block_inputs,
-    sample_tokens,
-)
+from sglang_tpu.experimental.speculative.spec_ops import build_draft_block_inputs
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
@@ -125,7 +128,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         del batch
         state = bucket.state
         bs = state.seq_lens.shape[0]
-        block_hidden, graph_draft_tokens = self._forward_draft_block(
+        block_hidden, graph_draft_tokens, draft_lattice = self._forward_draft_block(
             bucket=bucket, rows=rows, verify_input=verify_input
         )
         # No confidence budget yet: every bucket verifies all gamma drafts.
@@ -141,7 +144,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 num_verify_drafts=num_verify_drafts,
             )
         draft_tokens, draft_logits = self._sample_draft_block(
-            block_hidden, state.bonus_tokens, temperatures, top_ks
+            block_hidden, state.bonus_tokens, draft_lattice, temperatures, top_ks
         )
         return DraftResult(
             draft_tokens=draft_tokens,
@@ -153,22 +156,23 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         self,
         block_hidden: torch.Tensor,
         bonus_tokens: torch.Tensor,
+        draft_lattice: DraftLattice | None,
         temperatures: torch.Tensor,
         top_ks: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sampled [pbs, gamma] drafts and their logits from the [pbs, width, H] block."""
-        # FIXME(junyanxu): sampled drafting runs eager until the sampling params can
-        # enter the draft graph (sampling_info is an ignored direct-compile input).
-
-        def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-            del step_idx
-            tokens = sample_tokens(
-                logits=step_logits, temperatures=temperatures, top_ks=top_ks
-            )
-            return self._tp_sync.sync(SpecTpSyncSite.SPEC_DRAFT_SAMPLE, tokens)
-
+        sampling = DraftSampling(
+            temperatures=temperatures,
+            top_ks=top_ks,
+            sync=functools.partial(
+                self._tp_sync.sync, SpecTpSyncSite.SPEC_DRAFT_SAMPLE
+            ),
+        )
         return self._block_draft_worker.sample_drafts(
-            block_hidden=block_hidden, bonus_tokens=bonus_tokens, sampler=sampler
+            block_hidden=block_hidden,
+            bonus_tokens=bonus_tokens,
+            draft_lattice=draft_lattice,
+            sampler=sampling,
         )
 
     def commit(
@@ -281,8 +285,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         bucket: BucketState,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns the block's [pbs, width, H] draft hidden and the graph's greedy [pbs, gamma] drafts."""
+    ) -> tuple[torch.Tensor, torch.Tensor, DraftLattice | None]:
+        """The block's [pbs, width, H] draft hidden, greedy [pbs, gamma] drafts and lattice."""
         state = bucket.state
         padded_bs = state.seq_lens.shape[0]
         width = self._draft_block_width
@@ -310,7 +314,11 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         draft_tokens = logits_output.next_draft_tokens
         if hidden is None or draft_tokens is None:
             raise RuntimeError("Draft forward returned no hidden or draft tokens.")
-        return hidden.view(padded_bs, width, -1), draft_tokens
+        return (
+            hidden.view(padded_bs, width, -1),
+            draft_tokens,
+            logits_output.next_draft_lattice,
+        )
 
     def _bucket_sizes(self) -> tuple[int, ...]:
         compile_policy = self.target_worker.model_runner.compile_policy
@@ -367,9 +375,13 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 bonus_tokens = torch.zeros(
                     (padded_bs,), dtype=torch.int64, device=self.device
                 )
+                draft_lattice = self._block_draft_worker.warmup_draft_lattice(
+                    block_hidden=block_hidden, bonus_tokens=bonus_tokens
+                )
                 draft_tokens, draft_logits = self._sample_draft_block(
                     block_hidden,
                     bonus_tokens,
+                    draft_lattice,
                     torch.ones((padded_bs,), dtype=torch.float32).to(self.device),
                     torch.ones((padded_bs,), dtype=torch.int32).to(self.device),
                 )

@@ -11,13 +11,14 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.models.dflash import CandidateSelector, DFlash2DraftModel
 from sglang_tpu.experimental.speculative.spec_ops import pick
 
 # (row_scores [pbs, K], slot) -> chosen candidate index [pbs].
 CandidateChooser = Callable[[torch.Tensor, int], torch.Tensor]
-# (dense_logits [pbs, V], slot) -> sampled [pbs] tokens; block_draft_worker.DraftSampler.
-StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
+# (candidate_ids [pbs, gamma, K], scores [pbs, gamma, K, K]).
+DraftLattice = tuple[torch.Tensor, torch.Tensor]
 
 
 def build_lattice(
@@ -64,49 +65,112 @@ def walk_lattice(
     return torch.stack(tokens, dim=1)
 
 
+def walk_lattice_sampled(
+    *,
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    uniforms: torch.Tensor,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Drafts [pbs, gamma] by core's sample_path inverse-CDF walk over the K candidates.
+
+    Every predecessor row draws at once; the walk only follows indices, via one-hot picks.
+    """
+    top_k = scores.shape[-1]
+    temps = temperatures.view(-1).float().clamp_min(1e-5)[:, None, None, None]
+    probs = torch.softmax(scores.float() / temps, dim=-1)
+    maps = (uniforms[:, :, None, None] >= probs.cumsum(dim=-1)).sum(dim=-1)
+    maps = torch.where(
+        greedy_mask.view(-1, 1, 1), scores.argmax(dim=-1), maps.clamp_max(top_k - 1)
+    )
+    # Slot 0's K rows all score from the anchor, so any row will do.
+    index = torch.zeros(
+        candidate_ids.shape[0], dtype=torch.int64, device=candidate_ids.device
+    )
+    tokens = []
+    for slot in range(candidate_ids.shape[1]):
+        index = pick(maps[:, slot], index)
+        tokens.append(pick(candidate_ids[:, slot], index))
+    return torch.stack(tokens, dim=1)
+
+
+@compiled_op(uses_rng=True)
+def sample_lattice_path(
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+) -> torch.Tensor:
+    """Sampled drafts [pbs, gamma] in one program; rows with top_k <= 1 walk the argmax."""
+    uniforms = torch.rand(scores.shape[:2], dtype=torch.float32, device=scores.device)
+    return walk_lattice_sampled(
+        candidate_ids=candidate_ids,
+        scores=scores,
+        uniforms=uniforms,
+        temperatures=temperatures,
+        greedy_mask=top_ks.view(-1) <= 1,
+    )
+
+
+@compiled_op()
+def lattice_path_logits(
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Dense [pbs, gamma, V] rows of draft_tokens' path, rebuilt from the synced drafts."""
+    index = torch.zeros(
+        candidate_ids.shape[0], dtype=torch.int64, device=candidate_ids.device
+    )
+    rows = []
+    for slot in range(candidate_ids.shape[1]):
+        rows.append(pick(scores[:, slot], index).float())
+        slot_ids = candidate_ids[:, slot]
+        index = (slot_ids == draft_tokens[:, slot, None]).to(torch.int32).argmax(dim=-1)
+    rows_3d = torch.stack(rows, dim=1)
+    # -inf off the candidates, so softmax(dense / T) is the selector's q.
+    return torch.full(
+        (*rows_3d.shape[:2], vocab_size),
+        float("-inf"),
+        dtype=rows_3d.dtype,
+        device=rows_3d.device,
+    ).scatter(-1, candidate_ids, rows_3d)
+
+
 def sample_drafts(
     *,
-    draft_model: DFlash2DraftModel,
-    draft_hidden: torch.Tensor,
-    anchor_tokens: torch.Tensor,
+    draft_lattice: DraftLattice,
     vocab_size: int,
-    sampler: StepSampler,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    sync: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sampled drafts [pbs, gamma] and the dense [pbs, gamma, V] logits q is drawn from."""
-    with torch.no_grad():
-        candidate_ids, scores = build_lattice(draft_model, draft_hidden, anchor_tokens)
-    dense_rows: list[torch.Tensor] = []
-
-    def choose(row: torch.Tensor, slot: int) -> torch.Tensor:
-        slot_ids = candidate_ids[:, slot]
-        # -inf off the candidates, so softmax(dense / T) is the selector's q.
-        dense = torch.full(
-            (row.shape[0], vocab_size),
-            float("-inf"),
-            dtype=row.dtype,
-            device=row.device,
-        ).scatter(-1, slot_ids, row)
-        dense_rows.append(dense)
-        token = sampler(dense, slot)
-        return (slot_ids == token[:, None]).to(torch.int32).argmax(dim=-1)
-
-    draft_tokens = walk_lattice(
-        candidate_ids=candidate_ids, scores=scores, choose=choose
+    candidate_ids, scores = draft_lattice
+    # Ranks draw from their own generators: sync once, then every rank rebuilds q
+    # along the synced path.
+    draft_tokens = sync(
+        sample_lattice_path(candidate_ids, scores, temperatures, top_ks)
     )
-    return draft_tokens, torch.stack(dense_rows, dim=1)
+    return draft_tokens, lattice_path_logits(
+        candidate_ids, scores, draft_tokens, vocab_size
+    )
 
 
 def sample_draft_tokens(
     self: DFlash2DraftModel, hidden_states: torch.Tensor, input_ids: torch.Tensor
-) -> torch.Tensor:
-    """Greedy selector path [bs, gamma], traced into the TPU draft graph."""
+) -> tuple[torch.Tensor, DraftLattice]:
+    """Greedy selector path [bs, gamma] and its lattice, traced into the TPU draft graph."""
     block = self.block_size
     hidden_3d = hidden_states.view(-1, block, hidden_states.shape[-1])
     candidate_ids, scores = build_lattice(
         self, hidden_3d[:, 1:], input_ids.view(-1, block)[:, 0]
     )
-    return walk_lattice(
+    tokens = walk_lattice(
         candidate_ids=candidate_ids,
         scores=scores,
         choose=lambda row, slot: torch.argmax(row, dim=-1),
     )
+    return tokens, (candidate_ids, scores)

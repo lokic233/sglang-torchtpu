@@ -279,8 +279,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 compute_base_logits=lambda values: (values, None),
                 markov_head=SimpleNamespace(sample_block=sample_block),
             )
-            result = DSparkDraftModel.sample_draft_tokens_tpu(model, hidden, tokens)
+            result, lattice = DSparkDraftModel.sample_draft_tokens_tpu(
+                model, hidden, tokens
+            )
             torch.testing.assert_close(result, torch.full((2, 2), 3, dtype=torch.int64))
+            self.assertIsNone(lattice)
         with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
             sentinel = object()
             self.assertIs(

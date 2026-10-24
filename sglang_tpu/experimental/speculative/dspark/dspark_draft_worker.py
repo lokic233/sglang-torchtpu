@@ -24,6 +24,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang_tpu.experimental.compilation.block_compile_policy import block_draft_width
 from sglang_tpu.experimental.speculative.block_draft_worker import (
+    DraftLattice,
     DraftSampler,
     TpuBlockDraftWorker,
 )
@@ -63,8 +64,10 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
         *,
         block_hidden: torch.Tensor,
         bonus_tokens: torch.Tensor,
+        draft_lattice: DraftLattice | None,
         sampler: DraftSampler,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        del draft_lattice
         # Anchor drafts read all gamma rows; the rest drop the anchor row, so
         # draft_hidden[:, j - 1] predicts d_j at position n + j.
         bs = block_hidden.shape[0]
