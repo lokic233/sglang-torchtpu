@@ -143,6 +143,21 @@ jobs:
               )
               return result.stdout
 
+          nodes = json.loads(read("get", "nodes", "-o", "json"))
+          for node in nodes["items"]:
+              labels = node["metadata"].get("labels", {})
+              if not labels.get("ci-tpu-pool", "").startswith("nightly"):
+                  continue
+              fields = {k: labels.get(k) for k in ("ci-tpu-pool", "ci-tpu-lane", "cloud.google.com/gke-tpu-topology")}
+              fields["tpu_chips"] = node.get("status", {}).get("allocatable", {}).get("google.com/tpu")
+              fields["conditions"] = node.get("status", {}).get("conditions", [])
+              print("NODE", node["metadata"]["name"], json.dumps(fields), flush=True)
+          flavors = json.loads(read("get", "resourceflavors", "-o", "json"))
+          for flavor in flavors["items"]:
+              if "nightly" in flavor["metadata"]["name"]:
+                  print("FLAVOR", flavor["metadata"]["name"], json.dumps(flavor["spec"]), flush=True)
+          queue = json.loads(read("get", "clusterqueue", "tpu-nightly-2h", "-o", "json"))
+          print("QUEUE", json.dumps({"spec": queue["spec"], "status": queue.get("status", {})}), flush=True)
           resources = json.loads(read("get", "jobsets", "-o", "json"))
           prefixes = ("tpu-ci-accuracy-muse-spark-", "tpu-ci-pd-mh-muse-dflash-")
           for item in resources["items"]:
