@@ -115,14 +115,19 @@ recipe; a model that grows a second variant moves to a directory.
 
 Muse Spark accuracy runs AIME 2025 (three passes), GPQA Diamond, full GSM8K,
 MMLU-Pro (50 examples per subject), and full MMMU-Pro standard-10 (1,730
-questions). Only the MMMU-Pro recipe enables the vision tower. The checkpoint
+questions). Nightly MMMU-Pro uses four disjoint shards (433, 433, 432, 432)
+and rejects missing or duplicated question IDs before reporting the combined
+full-set score. The unsharded test remains a manual reference. Only the
+MMMU-Pro recipe enables the vision tower. The checkpoint
 must be staged at `/weights/Muse-Spark-Open-816B-A42B-NVFP4`. GPQA's reference
 is the [model card](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B),
 and GSM8K's is the TPU first-100 low-effort result. The initial AIME, MMLU-Pro,
-and MMMU-Pro references still need TPU calibration. Individual benchmarks select `model=muse-spark-aime`,
+and MMMU-Pro references still need TPU calibration.
+
+Individual benchmarks select `model=muse-spark-aime`,
 `model=muse-spark-gpqa`, `model=muse-spark-gsm8k`,
 `model=muse-spark-mmlupro`, or `model=muse-spark-mmmupro`. The full selection
-runs at most three benchmarks concurrently. MMLU-Pro retains raw and filtered
+runs at most three jobs concurrently. MMLU-Pro retains raw and filtered
 predictions in CI log archives, including when its gate fails.
 
 The Muse P/D gates need two two-host slices and the draft checkpoint at

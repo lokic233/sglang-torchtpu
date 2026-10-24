@@ -177,6 +177,164 @@ def _static_pd_files() -> list:
     return files
 
 
+class TestFullMMMUCollection(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "test_full_eval_collector", TPU_CI / "collect_full_evals.py"
+        )
+        cls.collector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.collector)
+
+    @staticmethod
+    def rows(model, count, aggregate=None):
+        result = []
+        for shard in range(count):
+            ids = [f"question-{i}" for i in range(shard, 1730, count)]
+            correct = 0 if shard == 0 else len(ids)
+            result.append(
+                {
+                    "model": model,
+                    "aggregate": aggregate,
+                    "shard": shard,
+                    "shards": count,
+                    "questions": len(ids),
+                    "correct": correct,
+                    "score": correct / len(ids),
+                    "ids": ids,
+                }
+            )
+        return result
+
+    def test_four_stride_shards_cover_every_question_once(self):
+        from sglang.test.tpu.evals.mmmu_full import shard_rows
+
+        rows = self.rows("muse", 4)
+        self.assertEqual([len(row["ids"]) for row in rows], [433, 433, 432, 432])
+        for row in rows:
+            self.assertEqual(
+                row["ids"],
+                shard_rows([f"question-{i}" for i in range(1730)], row["shard"], 4),
+            )
+        result = self.collector.combine_shards(rows)
+        self.assertEqual(result["questions"], 1730)
+        self.assertEqual(result["correct"], 1297)
+        self.assertEqual(result["score"], 1297 / 1730)
+
+    def test_missing_duplicate_or_inconsistent_shards_fail(self):
+        from copy import deepcopy
+
+        rows = self.rows("muse", 4)
+        with self.assertRaisesRegex(ValueError, "Expected all"):
+            self.collector.combine_shards(rows[:-1])
+        duplicate = deepcopy(rows)
+        duplicate[1]["ids"][0] = duplicate[0]["ids"][0]
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            self.collector.combine_shards(duplicate)
+        inconsistent = deepcopy(rows)
+        inconsistent[1]["shards"] = 2
+        with self.assertRaisesRegex(ValueError, "Expected all"):
+            self.collector.combine_shards(inconsistent)
+
+    def test_models_with_the_same_question_ids_stay_separate(self):
+        groups = {}
+        for row in self.rows("muse", 4) + self.rows("kimi", 2):
+            self.collector.add_summary(groups, row)
+        self.assertEqual(set(groups), {("muse", ""), ("kimi", "")})
+        self.assertEqual(
+            self.collector.combine_shards(
+                list(groups[("muse", "")]["shards"].values())
+            )["questions"],
+            1730,
+        )
+        self.assertEqual(
+            self.collector.combine_shards(
+                list(groups[("kimi", "")]["shards"].values())
+            )["questions"],
+            1730,
+        )
+        conflicting = dict(self.rows("muse", 4)[0], correct=1)
+        with self.assertRaisesRegex(ValueError, "Conflicting"):
+            self.collector.add_summary(groups, conflicting)
+        self.assertTrue(groups[("muse", "")]["invalid"])
+
+    def test_collector_emits_full_identity_and_retains_mmlu_predictions(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        from sglang.test.tpu.evals.full_eval_artifacts import archive_results
+
+        aggregate = {
+            "id": "accuracy-muse-spark-mmmupro",
+            "display_name": "Muse Spark",
+            "model": "muse",
+            "baseline": 0.75,
+            "atol": 0.10,
+        }
+        rows = self.rows("muse", 4, aggregate) + self.rows("kimi", 2)
+        jobs, logs = [], {}
+        for index, row in enumerate(rows):
+            name = (
+                f"accuracy-muse-spark-mmmupro-shard{row['shard']}"
+                if row["model"] == "muse"
+                else f"test_tpu_kimi_mmmu_shard{row['shard']}"
+            )
+            jobs.append({"id": index, "name": name, "conclusion": "success"})
+            logs[index] = "MMMU_SHARD_RESULT " + json.dumps(row)
+        jobs.append(
+            {"id": 77, "name": "accuracy-muse-mmlupro", "conclusion": "failure"}
+        )
+        jobs.append({"id": 99, "name": "mmmupro-shard9", "conclusion": "skipped"})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            predictions = root / "predictions"
+            predictions.mkdir()
+            (predictions / "results.json").write_text('{"raw": "the answer is (A)"}')
+            archive_log = io.StringIO()
+            with redirect_stdout(archive_log):
+                archive_results(predictions)
+            logs[77] = archive_log.getvalue()
+
+            def github(args, **kwargs):
+                if "--paginate" in args:
+                    return json.dumps([{"jobs": jobs}])
+                return logs[int(args[2].split("/")[-2])]
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                output = io.StringIO()
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "GH_REPO": "test/repo",
+                            "RUN_ID": "1",
+                            "GITHUB_STEP_SUMMARY": str(root / "summary"),
+                        },
+                    ),
+                    patch.object(
+                        self.collector.subprocess, "check_output", side_effect=github
+                    ),
+                    redirect_stdout(output),
+                ):
+                    self.collector.main()
+                full = root / "full-eval-results"
+                summaries = json.loads((full / "mmmu-model-summaries.json").read_text())
+                self.assertEqual({row["model"] for row in summaries}, {"muse", "kimi"})
+                self.assertTrue(all(row["questions"] == 1730 for row in summaries))
+                self.assertIn('"id": "accuracy-muse-spark-mmmupro"', output.getvalue())
+                self.assertEqual(
+                    json.loads((full / "77" / "results.json").read_text()),
+                    {"raw": "the answer is (A)"},
+                )
+            finally:
+                os.chdir(previous)
+
+
 class TestAccuracyRuntimeBudgets(CustomTestCase):
     def test_single_host_suites_leave_time_for_admission(self):
         """An excessive estimate makes the runner reject a queued job immediately."""

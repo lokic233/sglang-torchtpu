@@ -179,8 +179,17 @@ jobs:
             suite: nightly-tpu-accuracy-muse-spark-mmlupro
             run_name: accuracy-muse-spark-mmlupro
           - benchmark: mmmupro
-            suite: nightly-tpu-accuracy-muse-spark-mmmupro
-            run_name: accuracy-muse-spark-mmmupro
+            suite: nightly-tpu-accuracy-muse-spark-mmmupro-shard0
+            run_name: accuracy-muse-mm-shard0
+          - benchmark: mmmupro
+            suite: nightly-tpu-accuracy-muse-spark-mmmupro-shard1
+            run_name: accuracy-muse-mm-shard1
+          - benchmark: mmmupro
+            suite: nightly-tpu-accuracy-muse-spark-mmmupro-shard2
+            run_name: accuracy-muse-mm-shard2
+          - benchmark: mmmupro
+            suite: nightly-tpu-accuracy-muse-spark-mmmupro-shard3
+            run_name: accuracy-muse-mm-shard3
     name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -465,8 +474,10 @@ jobs:
       id-token: write
 
   collect-full-evaluations:
-    needs: accuracy-multihost
-    if: ${{ always() && needs.accuracy-multihost.result != 'skipped' }}
+    needs: [accuracy-multihost, accuracy-muse-spark]
+    if: >-
+      ${{ always() && (needs.accuracy-multihost.result != 'skipped'
+          || needs.accuracy-muse-spark.result != 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

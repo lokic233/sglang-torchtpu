@@ -264,7 +264,10 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-muse-spark-gpqa",
         "nightly-tpu-accuracy-muse-spark-gsm8k",
         "nightly-tpu-accuracy-muse-spark-mmlupro",
-        "nightly-tpu-accuracy-muse-spark-mmmupro",
+        "nightly-tpu-accuracy-muse-spark-mmmupro-shard0",
+        "nightly-tpu-accuracy-muse-spark-mmmupro-shard1",
+        "nightly-tpu-accuracy-muse-spark-mmmupro-shard2",
+        "nightly-tpu-accuracy-muse-spark-mmmupro-shard3",
         "nightly-tpu-accuracy-glm-5-3-flash-aime",
         # External tpu7x cluster (nightly-test-external-tpu.yml; see
         # .github/tpu-ci/external/README.md). 1host: single-host tests that launch
