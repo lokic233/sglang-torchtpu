@@ -8,7 +8,8 @@ from sglang.test.tpu import MUSE_SPARK, make_model_config, make_runner
 from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase
 
 register_tpu_ci(
-    est_time=14400,
+    # The renderer reserves 1.5x this estimate under a six-hour runner cap.
+    est_time=10800,
     suite="nightly-tpu-accuracy-muse-spark-mmmupro",
     nightly=True,
     labels=["singlehost", "muse-spark-open-816b-a42b", "accuracy", "multimodal"],

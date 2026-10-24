@@ -177,6 +177,58 @@ def _static_pd_files() -> list:
     return files
 
 
+class TestAccuracyRuntimeBudgets(CustomTestCase):
+    def test_single_host_suites_leave_time_for_admission(self):
+        """An excessive estimate makes the runner reject a queued job immediately."""
+        import tempfile
+
+        import yaml
+
+        workflow = yaml.safe_load((WORKFLOWS / "accuracy-test-tpu.yml").read_text())
+        suites = []
+        for job in workflow["jobs"].values():
+            args = job.get("with", {})
+            if args.get("hosts") != 1 or "suite" not in args:
+                continue
+            rows = job.get("strategy", {}).get("matrix", {}).get("include", [])
+            if rows:
+                suites.extend(row["suite"] for row in rows)
+            else:
+                suites.append(args["suite"])
+        # Scan the real accuracy files without repeatedly traversing unrelated
+        # kernel and serving tests for every suite.
+        with tempfile.TemporaryDirectory() as tests_dir:
+            for name, root in (
+                ("legacy", TPU_TESTS / "nightly-accuracy"),
+                ("taxonomy", TAXONOMY_TPU_TESTS["nightly-accuracy"]),
+            ):
+                (Path(tests_dir) / name).symlink_to(root, target_is_directory=True)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import json, sys; sys.path.insert(0, sys.argv[1]); "
+                    "from render_jobset import suite_wait_seconds; "
+                    "print(json.dumps({s: suite_wait_seconds(s, sys.argv[3], "
+                    "nightly=True) for s in json.loads(sys.argv[2])}))",
+                    str(TPU_CI),
+                    json.dumps(suites),
+                    tests_dir,
+                ],
+                cwd=REPO,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        self.assertTrue(suites)
+        for suite, deadline in json.loads(proc.stdout).items():
+            with self.subTest(suite=suite):
+                # The workflow reserves 600s beyond the JobSet deadline,
+                # 900s for pod binding and 600s for setup from its six hours.
+                admission = 21600 - (deadline + 600) - 900 - 600
+                self.assertGreater(admission, 0, suite)
+
+
 class TestJobMapsToOneTest(CustomTestCase):
     """One GitHub job <-> one test file, rendered from the real discovery.
 
