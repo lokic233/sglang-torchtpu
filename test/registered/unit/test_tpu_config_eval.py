@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -118,6 +119,9 @@ class TestAccuracyRecipes(unittest.TestCase):
         "recipe/configs/gpt_oss_120b/accuracy_gpqa.py",
         "recipe/configs/gpt_oss_120b/accuracy_gsm8k.py",
         "recipe/configs/gpt_oss_120b/accuracy_mmlupro.py",
+        "recipe/configs/muse_spark/accuracy.py",
+        "recipe/configs/muse_spark/accuracy_gsm8k.py",
+        "recipe/configs/muse_spark/accuracy_mmmupro.py",
     )
 
     def test_multihost_rank_resolves_from_jobset_topology(self):
@@ -216,6 +220,85 @@ class TestAccuracyRecipes(unittest.TestCase):
                     )
                     declared.add(script)
         self.assertEqual(declared, set(self.MULTIHOST))
+
+
+class TestMuseSparkPDRecipes(CustomTestCase):
+    """P/D role recipes must retain each slice's distributed rendezvous."""
+
+    def test_mxint8_gate_rejects_a_bf16_server(self):
+        from types import SimpleNamespace
+
+        from sglang_tpu.testing.muse_spark_pd import MuseSparkDflashPDTestCase
+
+        class Mxint8Gate(MuseSparkDflashPDTestCase):
+            kv_cache_dtype = "mxint8"
+            prefill_url = "http://prefill"
+            decode_url = "http://decode"
+
+        response = SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {
+                "nnodes": 2,
+                "tp_size": 16,
+                "ep_size": 1,
+                "page_size": 128,
+                "kv_cache_dtype": "bfloat16",
+            },
+        )
+        with patch("requests.get", return_value=response):
+            with self.assertRaisesRegex(
+                AssertionError, "kv_cache_dtype.*mxint8.*bfloat16"
+            ):
+                Mxint8Gate.check_server_configuration()
+
+    def test_every_role_and_dtype_retains_both_hosts(self):
+        from benchmark.tpu.recipe.configs.muse_spark.pd_multihost_prefix_cache_kv_offload_dflash import (
+            role_config,
+        )
+
+        for dtype in ("bfloat16", "mxint8"):
+            for role in ("prefill", "decode"):
+                for rank in (0, 1):
+                    with self.subTest(dtype=dtype, role=role, rank=rank):
+                        hosts = f"pair-{role}-0-0,pair-{role}-0-1"
+                        plan = plan_launch(
+                            role_config(role, kv_cache_dtype=dtype),
+                            inherited={
+                                "TPU_WORKER_ID": str(rank),
+                                "TPU_WORKER_HOSTNAMES": hosts,
+                                # Leaking the single-host base's default drops
+                                # rank 1 and leaves the leader stuck at rendezvous.
+                                "FORCE_SINGLE_HOST": "1",
+                                "SGLANG_SIMULATE_ACC_LEN": "4.05",
+                            },
+                        )
+                        args = plan.config.server_args
+                        self.assertEqual((args["nnodes"], args["node_rank"]), (2, rank))
+                        self.assertEqual(
+                            args["dist_init_addr"],
+                            ("0.0.0.0" if rank == 0 else hosts.split(",")[0])
+                            + ":10011",
+                        )
+                        self.assertEqual(plan.env["TPU_WORKER_HOSTNAMES"], hosts)
+                        self.assertNotIn("FORCE_SINGLE_HOST", plan.env)
+                        self.assertNotIn("SGLANG_SIMULATE_ACC_LEN", plan.env)
+                        self.assertEqual(args["kv_cache_dtype"], dtype)
+                        self.assertEqual(
+                            args["speculative_draft_kv_cache_dtype"], "bfloat16"
+                        )
+                        self.assertEqual(args["speculative_algorithm"], "DFLASH")
+
+                        import argparse
+
+                        from sglang.srt.server_args import ServerArgs
+
+                        parser = argparse.ArgumentParser()
+                        ServerArgs.add_cli_args(parser)
+                        parser.parse_args(
+                            plan.command[
+                                plan.command.index("sglang.launch_server") + 1 :
+                            ]
+                        )
 
 
 class TestWorkloadProfiles(unittest.TestCase):
