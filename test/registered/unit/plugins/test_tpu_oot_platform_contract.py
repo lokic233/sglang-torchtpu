@@ -336,8 +336,6 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         from sglang.srt.plugins.hook_registry import HookType
         from sglang_tpu.hooks import HOOKS
         from sglang_tpu.hooks.attn_residual import (
-            aggregate,
-            aggregate_fused_add,
             prepare_attn_residual_kernel,
             register_attn_residual_ops,
         )
@@ -455,22 +453,6 @@ class TestTpuOOTPlatformContract(CustomTestCase):
                 "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
                 prepare_attn_residual_kernel,
                 HookType.AFTER,
-            ),
-            HOOKS,
-        )
-        self.assertIn(
-            (
-                "sglang.srt.layers.attn_residual._aggregate",
-                aggregate,
-                HookType.AROUND,
-            ),
-            HOOKS,
-        )
-        self.assertIn(
-            (
-                "sglang.srt.layers.attn_residual._aggregate_fused_add",
-                aggregate_fused_add,
-                HookType.AROUND,
             ),
             HOOKS,
         )
