@@ -1830,6 +1830,9 @@ class Scheduler(
         from sglang_tpu.compilation.spec_decode_compile_policy import (
             BaseSpecDecodeCompilePolicyMixin,
         )
+        from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
+            DFlashSpecDecodeCompilePolicyMixin,
+        )
         from sglang_tpu.spec_op_precompile import (
             precompile_spec_v2_ops,
         )
@@ -1848,15 +1851,19 @@ class Scheduler(
             or draft_runner.model.config.vocab_size
         )
 
-        precompile_spec_v2_ops(
-            device=torch.device(self.tp_worker.model_runner.device),
-            physical_batch_buckets=compile_policy.b_bucketer.buckets,
-            num_verify_tokens=compile_policy.draft_token_num,
-            vocab_size=self.model_config.vocab_size,
-            draft_vocab_size=draft_vocab_size,
-            hidden_size=hidden_size,
-            hidden_dtype=hidden_dtype,
-        )
+        verify_shapes = {compile_policy.draft_token_num: compile_policy.full_verify_buckets()}
+        if isinstance(compile_policy, DFlashSpecDecodeCompilePolicyMixin):
+            verify_shapes.update(compile_policy.narrow_verify_shapes())
+        for num_verify_tokens, buckets in verify_shapes.items():
+            precompile_spec_v2_ops(
+                device=torch.device(self.tp_worker.model_runner.device),
+                physical_batch_buckets=buckets,
+                num_verify_tokens=num_verify_tokens,
+                vocab_size=self.model_config.vocab_size,
+                draft_vocab_size=draft_vocab_size,
+                hidden_size=hidden_size,
+                hidden_dtype=hidden_dtype,
+            )
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (

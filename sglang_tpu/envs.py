@@ -8,7 +8,7 @@ core readers move; never declare one name in both registries.
 
 from __future__ import annotations
 
-from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt
+from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt, EnvStr
 
 __all__ = ["TpuEnvs", "envs"]
 
@@ -68,6 +68,9 @@ class TpuEnvs:
     # TP size); larger steps run the native decoder. Steps above 32 rows use the
     # large-step paths (ops._BASE_STEP_MAX_ROWS).
     SGLANG_TPU_MUSE_MK_MAX_ROWS = EnvInt(32)
+    # DFlash: verify only the first WIDTH tokens of each draft block once the decode batch
+    # reaches MIN_BS requests (dflash_adaptive_verify.py); "" verifies the full block.
+    SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY = EnvStr("")
     # Megakernel attention over SEQ_ALONG_LANE pools: tokens per KV chunk, a multiple of the page.
     # Larger chunks shorten the per-chunk softmax chain at long context.
     SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS = EnvInt(512)

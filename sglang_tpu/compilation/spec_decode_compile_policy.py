@@ -100,7 +100,7 @@ class BaseSpecDecodeCompilePolicyMixin:
         """Compile TARGET_VERIFY across the batch-size buckets."""
         assert self.b_bucketer is not None
         draft_token_num = self.draft_token_num
-        bs_buckets = list(self.b_bucketer.buckets)
+        bs_buckets = self.full_verify_buckets()
         logger.info(
             "[spec compile policy] TARGET_VERIFY: %d shapes "
             "(bs=%s, draft_token_num=%d)",
@@ -211,6 +211,11 @@ class BaseSpecDecodeCompilePolicyMixin:
                 compile_range.set_description(
                     f"Compiled {desc} ({shape_desc}) in {elapsed:.1f}s{hbm_str}"
                 )
+
+    def full_verify_buckets(self) -> list[int]:
+        """Batch buckets whose verify runs the full draft_token_num width."""
+        assert self.b_bucketer is not None
+        return list(self.b_bucketer.buckets)
 
     def make_null_spec_info(self) -> SpecInput:
         """Create null speculative input metadata for extend compilation.

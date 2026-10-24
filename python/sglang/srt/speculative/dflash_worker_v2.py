@@ -99,6 +99,11 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu, is_xpu
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.dflash_adaptive_verify import (
+    parse_adaptive_verify,
+    select_verify_width,
+)
 from sglang_tpu.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
     build_tpu_draft_extend_metadata,
@@ -613,6 +618,34 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
         )
+        self._adaptive_verify_rules = (
+            parse_adaptive_verify(
+                tpu_envs.SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY.get(), int(self.block_size)
+            )
+            if _is_tpu
+            else ()
+        )
+        if SIMULATE_ACC_LEN > 0 and any(
+            r.simulate_accept_length is None for r in self._adaptive_verify_rules
+        ):
+            raise ValueError(
+                "SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY needs MIN_BS:WIDTH:ACC_LEN rules "
+                "when SGLANG_SIMULATE_ACC_LEN is set."
+            )
+        # Narrow widths select the block's leading columns through these indices: an
+        # index_select output is a real buffer, a strided slice is not on TPU.
+        self._verify_cols = {
+            r.width: torch.arange(r.width, dtype=torch.int64, device=self.device)
+            for r in self._adaptive_verify_rules
+        }
+        self._verify_tokens_bufs: dict[int, torch.Tensor] = {}  # width -> [cap_bs, width]
+        self._verify_width_ct: dict[int, int] = {}
+        if self._adaptive_verify_rules and get_parallel().tp_rank == 0:
+            logger.info(
+                "DFLASH adaptive verify: block %d, rules %s",
+                self.block_size,
+                self._adaptive_verify_rules,
+            )
         self._draft_greedy_gathered_max_buf: torch.Tensor | None = None
         self._draft_greedy_gathered_ids_buf: torch.Tensor | None = None
         self._draft_greedy_gather_cap: int = 0
@@ -1178,6 +1211,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_verify_out_cache_loc_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
+        # Bucket-wide accept reads these like _draft_block_tokens_buf, ghost rows included.
+        self._verify_tokens_bufs = {
+            width: torch.full(
+                (new_cap, width), int(self._mask_token_id), dtype=torch.long, device=device
+            )
+            for width in self._verify_cols
+        }
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
@@ -2463,6 +2503,55 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
 
+    def _select_verify_rule(self, *, batch: ScheduleBatch, bs: int):
+        """The adaptive narrow-verify rule for this step, or None to verify the full block."""
+        if (
+            not self._adaptive_verify_rules
+            or self._selector_sample is not None
+            or batch.has_grammar
+            or batch.return_logprob
+            or self._need_mamba_verify_commit
+        ):
+            return None
+        return select_verify_width(self._adaptive_verify_rules, bs)
+
+    def _narrow_verify_block(
+        self,
+        *,
+        width: int,
+        bs: int,
+        draft_tokens: torch.Tensor,
+        positions_2d: torch.Tensor,
+        cache_loc_2d: torch.Tensor,
+        swa_cache_loc_2d: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Leading ``width`` columns of the [bs, block_size] verify inputs.
+
+        Returns (tokens [bs, width] in the width's buffer, flat positions,
+        cache_loc_2d [bs, width], swa_cache_loc_2d [bs, width] or None).
+        """
+        cols = self._verify_cols[width]
+        tokens = self._verify_tokens_bufs[width][:bs]
+        tokens.copy_(torch.index_select(draft_tokens, 1, cols))
+        return (
+            tokens,
+            torch.index_select(positions_2d, 1, cols).reshape(-1),
+            torch.index_select(cache_loc_2d, 1, cols),
+            (
+                None
+                if swa_cache_loc_2d is None
+                else torch.index_select(swa_cache_loc_2d, 1, cols)
+            ),
+        )
+
+    def _count_verify_width(self, width: int) -> None:
+        if not self._adaptive_verify_rules:
+            return
+        self._verify_width_ct[width] = self._verify_width_ct.get(width, 0) + 1
+        # Arbitrary period; one line per few minutes of decode.
+        if sum(self._verify_width_ct.values()) % 20000 == 0 and get_parallel().tp_rank == 0:
+            logger.info("DFLASH adaptive verify steps by width: %s", self._verify_width_ct)
+
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
             return
@@ -2524,6 +2613,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_forward_batch: ForwardBatch,
         logits_output,
         draft_tokens: torch.Tensor,
+        tokens_buf: torch.Tensor,
         sampling_info,
         draft_input: DFlashDraftInputV2,
         block_size: int,
@@ -2538,6 +2628,7 @@ class DFlashWorkerV2(BaseSpecWorker):
           logits_output: Target verify outputs, padded to the bucket when the
             shim deferred unpadding.
           draft_tokens: Logical draft block ids, [bs, block_size].
+          tokens_buf: The bucket-wide buffer draft_tokens are the leading rows of.
           sampling_info: Sampling state, widened by prepare_spec_verify.
           draft_input: Draft-side spec info for this step.
           block_size: Draft rows per request.
@@ -2563,7 +2654,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH verify padding is not block-aligned: "
                     f"{verify_padding.state}, block_size={block_size}."
                 )
-            candidates = self._draft_block_tokens_buf[:physical_bs]
+            candidates = tokens_buf[:physical_bs]
 
         accept_result = self._accept_block(
             candidates=candidates,
@@ -2630,7 +2721,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # whose src-rank broadcast collapses to the flat base, so rank 0 enters
             # this collective as s64[bs*block_size] and the rest as s64[bs,block_size].
             target_predict = dflash_verify_argmax_torch(
-                next_token_logits, int(self.block_size)
+                next_token_logits, int(candidates.shape[1])
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if _is_tpu:
@@ -3262,6 +3353,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
         )
 
+        verify_rule = self._select_verify_rule(batch=batch, bs=bs)
+        verify_width = block_size if verify_rule is None else verify_rule.width
+        verify_tokens_buf = self._draft_block_tokens_buf
+        if verify_rule is not None:
+            # From here on the verify, accept and draft-KV write see the narrow block.
+            draft_tokens, positions, verify_out_cache_loc_2d, verify_swa_loc_2d = (
+                self._narrow_verify_block(
+                    width=verify_width,
+                    bs=bs,
+                    draft_tokens=draft_tokens,
+                    positions_2d=positions_2d,
+                    cache_loc_2d=verify_out_cache_loc_2d,
+                    swa_cache_loc_2d=verify_swa_loc_2d,
+                )
+            )
+            verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+            verify_tokens_buf = self._verify_tokens_bufs[verify_width]
+        self._count_verify_width(verify_width)
+
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
@@ -3270,7 +3380,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
             positions=positions,
-            draft_token_num=int(self.block_size),
+            draft_token_num=verify_width,
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
@@ -3345,7 +3455,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # prepare_spec_verify, which widens sampling_info and so len(sampling_info).
         # Only TPU pads the verify outputs; elsewhere the rows are already logical.
         logical_logits = (
-            logits_output.next_token_logits[: bs * block_size]
+            logits_output.next_token_logits[: bs * verify_width]
             if _is_tpu
             else logits_output.next_token_logits
         )
@@ -3353,7 +3463,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logical_logits,
                 sampling_info=sampling_info,
-                draft_token_num=int(self.block_size),
+                draft_token_num=verify_width,
             )
 
         # Constrain every chain position before accept picks from it.
@@ -3368,9 +3478,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_forward_batch=verify_forward_batch,
                 logits_output=logits_output,
                 draft_tokens=draft_tokens,
+                tokens_buf=verify_tokens_buf,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
-                block_size=block_size,
+                block_size=verify_width,
             )
         else:
             candidates = draft_tokens
@@ -3402,7 +3513,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # The sampling-verify branch does not materialize the target argmax.
                 target_predict = torch.argmax(
                     logits_output.next_token_logits, dim=-1
-                ).view(bs, int(self.block_size))
+                ).view(bs, verify_width)
             apply_dflash_simulated_acceptance(
                 # The bucketed accept returns bucket-sized candidates; the accept
                 # outputs are already trimmed to the live batch.
@@ -3412,7 +3523,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=commit_lens,
                 bonus=bonus,
                 out_tokens=out_tokens,
-                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_len=(
+                    SIMULATE_ACC_LEN
+                    if verify_rule is None
+                    else verify_rule.simulate_accept_length
+                ),
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
             )
@@ -3424,7 +3539,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             sampling_info,
             next_token_logits=logits_output.next_token_logits,
             draft_input=draft_input,
-            draft_token_num=int(self.block_size),
+            draft_token_num=verify_width,
             bs=bs,
         )
         if sampling_mask_capture is not None:
@@ -3438,7 +3553,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch,
                 logits_output,
                 out_tokens.reshape(-1),
-                chain_stride=block_size,
+                chain_stride=verify_width,
             )
 
         if self._need_mamba_verify_commit:
@@ -3464,7 +3579,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, int(self.block_size), -1)
+        hidden = hidden.view(bs, verify_width, -1)
         target_hidden = hidden.reshape(-1, hidden.shape[-1])
 
         # Consume in this step: every decode graph size shares one aux output,
@@ -3493,7 +3608,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            speculative_num_draft_tokens=int(self.block_size),
+            speculative_num_draft_tokens=verify_width,
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
