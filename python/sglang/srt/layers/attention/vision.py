@@ -5,7 +5,7 @@ import functools
 import math
 import warnings
 from functools import lru_cache, partial
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -52,7 +52,10 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 if _is_tpu:
-    from sglang_tpu.attention_pallas import _get_vision_flash_op
+    from sglang_tpu.attention_pallas import (
+        _get_vision_flash_op,
+        _get_vision_flash_rows_op,
+    )
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
@@ -1081,6 +1084,24 @@ def _build_tpu_segment_ids(
     return (positions.unsqueeze(0) >= seq_lens.unsqueeze(1)).to(torch.int32)
 
 
+class VisionAttentionRows(NamedTuple):
+    """Segment-local attention layout for ``VisionTpuAttention(rows=...)``.
+
+    Tokens of each short segment are gathered into rows of equal length, and
+    attention runs within a row only (see ``_get_vision_flash_rows_op``).
+
+    row_index: [num_rows * row_len] int32, the token held by each row slot.
+    row_segment_ids: [num_rows, row_len] int32, the segment of each slot. A query
+        attends only to keys of its own segment in its row; pad slots use an ID
+        that no segment in their row uses.
+    inverse_index: [seq_len] int32, the row slot whose output each token takes.
+    """
+
+    row_index: torch.Tensor
+    row_segment_ids: torch.Tensor
+    inverse_index: torch.Tensor
+
+
 class VisionTpuAttention(nn.Module):
     _BLOCK_SIZE = 128
     supports_segment_ids = True
@@ -1107,6 +1128,7 @@ class VisionTpuAttention(nn.Module):
             softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
         )
         self._flash_op = _get_vision_flash_op(float(self.scale))
+        self._flash_rows_op = _get_vision_flash_rows_op(float(self.scale))
         self._sdpa_fallback = VisionSdpaAttention(
             head_dim=head_dim,
             num_heads=num_heads,
@@ -1126,6 +1148,7 @@ class VisionTpuAttention(nn.Module):
         cu_seqlens=None,
         attention_mask=None,
         segment_ids=None,
+        rows: VisionAttentionRows | None = None,
         **kwargs,
     ):
         if attention_mask is not None and segment_ids is not None:
@@ -1142,6 +1165,26 @@ class VisionTpuAttention(nn.Module):
             repeats = q.shape[1] // k.shape[1]
             k = k.repeat_interleave(repeats, dim=1)
             v = v.repeat_interleave(repeats, dim=1)
+
+        if rows is not None:
+            if (
+                attention_mask is not None
+                or segment_ids is not None
+                or cu_seqlens is not None
+                or bsz != 1
+            ):
+                raise ValueError(
+                    "TPU vision row attention takes no attention_mask, segment_ids "
+                    "or cu_seqlens, and needs bsz == 1"
+                )
+            return self._flash_rows_op(
+                q,
+                k,
+                v,
+                rows.row_index.to(device=q.device, dtype=torch.int32),
+                rows.row_segment_ids.to(device=q.device, dtype=torch.int32),
+                rows.inverse_index.to(device=q.device, dtype=torch.int32),
+            )
 
         if attention_mask is not None:
             return self._sdpa_fallback(

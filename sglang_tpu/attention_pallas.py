@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import torch
 from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel import (
     paged_attention,
@@ -504,4 +505,75 @@ def _get_vision_flash_op(sm_scale: float):
 
     op.register_fake(_fake_vision_flash)
     _VISION_FLASH_OPS[key] = op
+    return op
+
+
+# ---------------------------------------------------------------------------
+# Vision encoder: segment-local attention over gathered rows
+# ---------------------------------------------------------------------------
+_VISION_FLASH_ROWS_OPS: dict[float, object] = {}
+
+
+def _get_vision_flash_rows_op(sm_scale: float):
+    """Return a cached pallas op for segment-local vision attention over gathered rows.
+
+    When every segment is short (local windows or tiles), the segment-ID op above
+    still computes every query-key block of the whole sequence and masks most of
+    them away. This op gathers each segment's tokens into fixed-length rows
+    (several short segments may share a row), runs flash attention per row with
+    per-slot segment IDs, and gathers the outputs back to token order. It costs
+    ``num_rows * row_len**2`` instead of ``seq_len**2``.
+    """
+    key = float(sm_scale)
+    op = _VISION_FLASH_ROWS_OPS.get(key)
+    if op is not None:
+        return op
+
+    from torch_tpu._internal import pallas
+
+    def _jax_vision_flash_rows(q, k, v, row_index, row_segment_ids, inverse_index):
+        # q, k, v: [seq_len, num_heads, head_dim], token-major.
+        num_rows, row_len = row_segment_ids.shape
+        _, num_heads, head_dim = q.shape
+
+        def to_rows(x):
+            x = jnp.take(x, row_index, axis=0)
+            return x.reshape(num_rows, row_len, num_heads, head_dim).transpose(
+                0, 2, 1, 3
+            )
+
+        out = flash_attention(
+            to_rows(q),
+            to_rows(k),
+            to_rows(v),
+            segment_ids=SegmentIds(q=row_segment_ids, kv=row_segment_ids),
+            causal=False,
+            sm_scale=sm_scale,
+            vmem_limit_bytes=None,
+        )
+        out = out.transpose(0, 2, 1, 3).reshape(num_rows * row_len, num_heads, head_dim)
+        return jnp.take(out, inverse_index, axis=0)
+
+    _jax_vision_flash_rows.__annotations__ = {
+        "q": jax.Array,
+        "k": jax.Array,
+        "v": jax.Array,
+        "row_index": jax.Array,
+        "row_segment_ids": jax.Array,
+        "inverse_index": jax.Array,
+        "return": jax.Array,
+    }
+
+    op_name = f"sglang_tpu::vision_flash_rows_s{key!r}".replace(".", "_").replace(
+        "-", "m"
+    )
+    op = pallas.jax_op(op_name, _jax_vision_flash_rows)
+
+    def _fake_vision_flash_rows(
+        q, k, v, row_index, row_segment_ids, inverse_index
+    ):
+        return torch.empty_like(q)
+
+    op.register_fake(_fake_vision_flash_rows)
+    _VISION_FLASH_ROWS_OPS[key] = op
     return op
