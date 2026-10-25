@@ -618,7 +618,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 commit_lens=commit_lens,
             )
 
-    def make_null_spec_info(self) -> DFlashVerifyInput:
+    def make_null_spec_info(self, draft_token_num: int | None = None) -> DFlashVerifyInput:
         """Create null DFlash verify input metadata for compilation.
 
         Returns:
@@ -631,7 +631,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             positions=torch.empty(
                 0, device=self.model_runner.device, dtype=torch.int64
             ),
-            draft_token_num=self.draft_token_num,
+            draft_token_num=draft_token_num or self.draft_token_num,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
@@ -732,7 +732,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             raise ValueError("DFlash worker cannot be None")
         overall = time.perf_counter()
         if get_disagg().disaggregation_mode != "prefill":
-            self._precompile_draft_verify(draft_attn_backend)
+            self._precompile_draft_verify(draft_attn_backend, dflash_worker)
             # A prefill-only engine never builds a draft block.
             self._precompile_fused_draft_block(dflash_worker)
         self._precompile_append_target_hidden_to_draft_kv_by_loc_tpu(dflash_worker)
@@ -898,7 +898,9 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         )
 
     def _precompile_draft_verify(
-        self, draft_attn_backend: AttentionBackend | None = None
+        self,
+        draft_attn_backend: AttentionBackend | None = None,
+        dflash_worker: DFlashWorkerV2 | None = None,
     ) -> None:
         """Compile DFLASH draft model forward across batch size buckets."""
         if self.b_bucketer is None:
@@ -907,25 +909,36 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             )
         bs_buckets = list(self.b_bucketer.buckets)
         draft_token_num = self.draft_token_num
-        shapes = [(bs, bs * draft_token_num) for bs in bs_buckets]
+        # (bs, block width): the full block everywhere, plus the adaptive narrow blocks.
+        shapes = [(bs, draft_token_num) for bs in bs_buckets] + [
+            (bs, w) for w, buckets in self.narrow_verify_shapes().items() for bs in buckets
+        ]
         logger.info(
-            "[spec compile policy] DFLASH DRAFT VERIFY: %d shapes (bs=%s, draft_token_num=%d)",
+            "[spec compile policy] DFLASH DRAFT VERIFY: %d shapes ((bs, width)=%s)",
             len(shapes),
-            bs_buckets,
-            draft_token_num,
+            shapes,
         )
 
         def run(shape: tuple[int, int]) -> str:
-            bs, num_tokens = shape
-            self._run_one(
-                num_tokens=num_tokens,
-                bs=bs,
-                mode=ForwardMode.TARGET_VERIFY,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                spec_info=self.make_null_spec_info(),
-                attn_backend=draft_attn_backend,
-            )
-            return f"bs={bs}, tokens={num_tokens}"
+            bs, width = shape
+            draft_model = None if dflash_worker is None else dflash_worker.draft_model
+            if width != draft_token_num:
+                assert draft_model is not None, "narrow draft blocks need the worker"
+                # The convolutions read the block size at trace time; match the runtime call.
+                draft_model.set_block_size(width)
+            try:
+                self._run_one(
+                    num_tokens=bs * width,
+                    bs=bs,
+                    mode=ForwardMode.TARGET_VERIFY,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    spec_info=self.make_null_spec_info(draft_token_num=width),
+                    attn_backend=draft_attn_backend,
+                )
+            finally:
+                if width != draft_token_num:
+                    draft_model.set_block_size(draft_token_num)
+            return f"bs={bs}, tokens={bs * width}"
 
         self._precompile_shapes("DFLASH DRAFT VERIFY", shapes, run)
 

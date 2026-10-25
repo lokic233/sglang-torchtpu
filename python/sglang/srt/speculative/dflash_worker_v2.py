@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import math
 import os
@@ -639,6 +640,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             for r in self._adaptive_verify_rules
         }
         self._verify_tokens_bufs: dict[int, torch.Tensor] = {}  # width -> [cap_bs, width]
+        self._narrow_block_spec_infos = {
+            width: make_draft_block_spec_info(draft_token_num=width, device=self.device)
+            for width in self._verify_cols
+        }
         self._verify_width_ct: dict[int, int] = {}
         if self._adaptive_verify_rules and get_parallel().tp_rank == 0:
             logger.info(
@@ -2507,7 +2512,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         """The adaptive narrow-verify rule for this step, or None to verify the full block."""
         if (
             not self._adaptive_verify_rules
-            or self._selector_sample is not None
             or batch.has_grammar
             or batch.return_logprob
             or self._need_mamba_verify_commit
@@ -2515,34 +2519,56 @@ class DFlashWorkerV2(BaseSpecWorker):
             return None
         return select_verify_width(self._adaptive_verify_rules, bs)
 
-    def _narrow_verify_block(
+    def _narrow_draft_block(
         self,
         *,
         width: int,
         bs: int,
-        draft_tokens: torch.Tensor,
+        block_size: int,
+        block_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None,
         positions_2d: torch.Tensor,
         cache_loc_2d: torch.Tensor,
         swa_cache_loc_2d: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Leading ``width`` columns of the [bs, block_size] verify inputs.
+    ) -> tuple[
+        torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None
+    ]:
+        """Leading ``width`` columns of the prepared [bs, block_size] draft block.
 
-        Returns (tokens [bs, width] in the width's buffer, flat positions,
-        cache_loc_2d [bs, width], swa_cache_loc_2d [bs, width] or None).
+        Returns block ids [bs, width], input embeds [bs * width, hidden] or None,
+        positions [bs, width], cache slots [bs, width] and SWA slots [bs, width] or None.
         """
         cols = self._verify_cols[width]
-        tokens = self._verify_tokens_bufs[width][:bs]
-        tokens.copy_(torch.index_select(draft_tokens, 1, cols))
-        return (
-            tokens,
-            torch.index_select(positions_2d, 1, cols).reshape(-1),
-            torch.index_select(cache_loc_2d, 1, cols),
-            (
-                None
-                if swa_cache_loc_2d is None
-                else torch.index_select(swa_cache_loc_2d, 1, cols)
-            ),
+
+        def narrow(t: torch.Tensor | None) -> torch.Tensor | None:
+            return None if t is None else torch.index_select(t, 1, cols)
+
+        embeds = (
+            None
+            if input_embeds is None
+            else torch.index_select(input_embeds.view(bs, block_size, -1), 1, cols).reshape(
+                bs * width, -1
+            )
         )
+        return (
+            narrow(block_ids),
+            embeds,
+            narrow(positions_2d),
+            narrow(cache_loc_2d),
+            narrow(swa_cache_loc_2d),
+        )
+
+    @contextlib.contextmanager
+    def _draft_block_size(self, width: int):
+        """Run the draft model at ``width``; its convolutions bake the block size into each graph."""
+        if width == int(self.block_size):
+            yield
+            return
+        self.draft_model.set_block_size(width)
+        try:
+            yield
+        finally:
+            self.draft_model.set_block_size(int(self.block_size))
 
     def _count_verify_width(self, width: int) -> None:
         if not self._adaptive_verify_rules:
@@ -3149,13 +3175,38 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
 
+        verify_rule = self._select_verify_rule(batch=batch, bs=bs)
+        verify_width = block_size if verify_rule is None else verify_rule.width
+        verify_tokens_buf = self._draft_block_tokens_buf
+        draft_block_spec_info = self._draft_block_spec_info
+        if verify_rule is not None:
+            # From here on the draft, verify, accept and draft-KV write all run the narrow
+            # block; the draft drafts natively at that width.
+            block_ids, input_embeds, positions_2d, verify_out_cache_loc_2d, verify_swa_loc_2d = (
+                self._narrow_draft_block(
+                    width=verify_width,
+                    bs=bs,
+                    block_size=block_size,
+                    block_ids=block_ids,
+                    input_embeds=input_embeds,
+                    positions_2d=positions_2d,
+                    cache_loc_2d=verify_out_cache_loc_2d,
+                    swa_cache_loc_2d=verify_swa_loc_2d,
+                )
+            )
+            positions = positions_2d.reshape(-1)
+            verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+            verify_tokens_buf = self._verify_tokens_bufs[verify_width]
+            draft_block_spec_info = self._narrow_block_spec_infos[verify_width]
+        self._count_verify_width(verify_width)
+
         # Only the Pallas RPA backend plans the draft block as an extend, so
         # the split is TPU-only; ForwardBatch leaves the fields None elsewhere.
         extend_split: dict[str, Any] = {}
         if _is_tpu:
             tpu_extend = build_tpu_draft_extend_metadata(
                 bs=bs,
-                width=block_size,
+                width=verify_width,
                 draft_prefix_lens=draft_prefix_lens,
                 seq_lens_cpu=batch.seq_lens_cpu,
                 extend_seq_lens_buf=self._draft_extend_seq_lens_buf,
@@ -3195,15 +3246,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             positions=positions,
             input_embeds=input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
-            spec_info=self._draft_block_spec_info,
+            spec_info=draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             **extend_split,
             num_token_non_padded=(
-                torch.tensor(bs * block_size, dtype=torch.int32, device=device)
+                torch.tensor(bs * verify_width, dtype=torch.int32, device=device)
                 if enable_num_token_non_padded()
                 else None
             ),
-            global_num_token_non_padded_cpu=bs * block_size,
+            global_num_token_non_padded_cpu=bs * verify_width,
         )
 
         if self.selector is not None or self.lilicorr is not None:
@@ -3218,6 +3269,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         with (
             grad_context(),
             draft_tp_context(self.draft_owns_attention),
+            self._draft_block_size(verify_width),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
@@ -3344,7 +3396,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
 
-        draft_tokens = self._draft_block_tokens_buf[:bs]
+        draft_tokens = verify_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
@@ -3352,25 +3404,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_tree = (
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
         )
-
-        verify_rule = self._select_verify_rule(batch=batch, bs=bs)
-        verify_width = block_size if verify_rule is None else verify_rule.width
-        verify_tokens_buf = self._draft_block_tokens_buf
-        if verify_rule is not None:
-            # From here on the verify, accept and draft-KV write see the narrow block.
-            draft_tokens, positions, verify_out_cache_loc_2d, verify_swa_loc_2d = (
-                self._narrow_verify_block(
-                    width=verify_width,
-                    bs=bs,
-                    draft_tokens=draft_tokens,
-                    positions_2d=positions_2d,
-                    cache_loc_2d=verify_out_cache_loc_2d,
-                    swa_cache_loc_2d=verify_swa_loc_2d,
-                )
-            )
-            verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
-            verify_tokens_buf = self._verify_tokens_bufs[verify_width]
-        self._count_verify_width(verify_width)
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
