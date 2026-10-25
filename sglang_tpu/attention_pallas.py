@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel import (
     paged_attention,
 )
@@ -466,20 +467,19 @@ class TpuPallasAttnBackend(AttentionBackend):
 # Vision encoder: non-causal flash attention with segment_ids
 # ---------------------------------------------------------------------------
 _VISION_FLASH_OPS: dict[float, object] = {}
+
+
 # The op attends over a vision encoder's patch sequence: queries and keys are an
 # image's patches (16,384 for an image capped at 4,096 tokens after 2x2 patch
 # merging). Up to 92,800 keys the kernel runs one KV step over the whole
 # sequence, so its VMEM footprint grows linearly with the patch count. On TPU7x a
 # 16,384-patch call needs ~24.75 MiB with two or more local heads, over the 24 MiB
-# scoped limit set by --xla_tpu_scoped_vmem_limit_kib=24576. With one local head
-# it needs 16-18 MiB: the K/V block index is the same at every grid step,
-# consistent with those blocks being single- rather than double-buffered. This
-# limit is sized for 16,384 patches at any head count (measured to 24,576; 32,768
-# fits only with one local head); longer sequences need KV tiling
-# (block_k_major < kv_seq_len).
-_VISION_FLASH_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
-
-
+# scoped limit set by --xla_tpu_scoped_vmem_limit_kib=24576. (One local head
+# needs 16-18 MiB: the K/V block index is the same at every grid step, consistent
+# with those blocks being single- rather than double-buffered.) The op therefore
+# takes the TensorCore's full VMEM, which is never below a configured process
+# limit. On TPU7x that holds 40,960 patches at any head count (49,152 with one
+# local head); longer sequences need KV tiling (block_k_major < kv_seq_len).
 def _get_vision_flash_op(sm_scale: float):
     """Return a cached pallas op for non-causal flash attention with segment IDs."""
     key = float(sm_scale)
@@ -497,7 +497,7 @@ def _get_vision_flash_op(sm_scale: float):
             segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
             causal=False,
             sm_scale=sm_scale,
-            vmem_limit_bytes=_VISION_FLASH_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
         )
 
     _jax_vision_flash.__annotations__ = {
