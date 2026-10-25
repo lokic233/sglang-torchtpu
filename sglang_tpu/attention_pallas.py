@@ -466,10 +466,14 @@ class TpuPallasAttnBackend(AttentionBackend):
 # Vision encoder: non-causal flash attention with segment_ids
 # ---------------------------------------------------------------------------
 _VISION_FLASH_OPS: dict[float, object] = {}
-# Up to 92,800 keys the kernel runs one step over the whole KV, so its tiles grow
-# with the sequence: at 16,384 tokens they exceed a 24 MiB scoped-VMEM limit
-# (--xla_tpu_scoped_vmem_limit_kib=24576) once more than one head is local.
-# Give the op its own limit, inside the 64 MiB TensorCore VMEM.
+# Up to 92,800 keys the kernel runs one KV step over the whole sequence, so its
+# VMEM footprint grows linearly with the key count. On TPU7x at 16,384 keys it
+# needs ~24.75 MiB with two or more local heads, over the 24 MiB scoped limit set
+# by --xla_tpu_scoped_vmem_limit_kib=24576. With one local head it needs 16-18
+# MiB: the K/V block index is the same at every grid step, consistent with those
+# blocks being single- rather than double-buffered. This limit is sized for
+# 16,384 keys at any head count (measured to 24,576; 32,768 fits only with one
+# local head); longer inputs need KV tiling (block_k_major < kv_seq_len).
 _VISION_FLASH_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
 
 
