@@ -33,6 +33,7 @@ from sglang_tpu.kernels.flash_attention import (
     SegmentIds,
     flash_attention,
 )
+from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -469,10 +470,6 @@ class TpuPallasAttnBackend(AttentionBackend):
 _VISION_FLASH_OPS: dict[float, object] = {}
 
 
-# Up to 92,800 keys the kernel runs one KV step over the whole sequence, so its
-# VMEM use grows with the patch count (~25 MiB at 16,384 patches with 2+ local
-# heads on TPU7x). Take the full VMEM, which a configured scoped limit never
-# exceeds; longer sequences need KV tiling (block_k_major < kv_seq_len).
 def _get_vision_flash_op(sm_scale: float):
     """Return a cached pallas op for non-causal flash attention with segment IDs."""
     key = float(sm_scale)
@@ -483,6 +480,10 @@ def _get_vision_flash_op(sm_scale: float):
     from torch_tpu._internal import pallas
 
     def _jax_vision_flash(q, k, v, seg_ids):
+        # Distributed programs are traced on a CPU mesh, where get_tpu_info()
+        # raises; substitute the physical TPU metadata, as the GDN op does.
+        with tpu_info_for_cpu_export():
+            vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
         return flash_attention(
             q,
             k,
@@ -490,7 +491,12 @@ def _get_vision_flash_op(sm_scale: float):
             segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
             causal=False,
             sm_scale=sm_scale,
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+            # Up to 92,800 keys the kernel runs one KV step over the whole
+            # sequence, so its VMEM use grows with the patch count (~25 MiB at
+            # 16,384 patches with 2+ local heads on TPU7x). The full VMEM is never
+            # below a configured scoped limit; longer sequences need KV tiling
+            # (block_k_major < kv_seq_len).
+            vmem_limit_bytes=vmem_limit_bytes,
         )
 
     _jax_vision_flash.__annotations__ = {
