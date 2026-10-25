@@ -221,8 +221,9 @@ class VisionTpuCompilePolicy(CompilePolicy):
                     torch.no_grad()(method),
                     name=self.name,
                     spmd_safe=self.spmd_safe,
+                    # An optional input (None) keys its own specialization.
                     specialization_key=lambda *args: tuple(
-                        (tuple(t.shape), t.dtype) for t in args
+                        None if t is None else (tuple(t.shape), t.dtype) for t in args
                     ),
                     model=model,
                     lift_rank=(
