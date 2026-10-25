@@ -466,6 +466,11 @@ class TpuPallasAttnBackend(AttentionBackend):
 # Vision encoder: non-causal flash attention with segment_ids
 # ---------------------------------------------------------------------------
 _VISION_FLASH_OPS: dict[float, object] = {}
+# Up to 92,800 keys the kernel runs one step over the whole KV, so its tiles grow
+# with the sequence: at 16,384 tokens they exceed a 24 MiB scoped-VMEM limit
+# (--xla_tpu_scoped_vmem_limit_kib=24576) once more than one head is local.
+# Give the op its own limit, inside the 64 MiB TensorCore VMEM.
+_VISION_FLASH_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
 
 
 def _get_vision_flash_op(sm_scale: float):
@@ -485,7 +490,7 @@ def _get_vision_flash_op(sm_scale: float):
             segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
             causal=False,
             sm_scale=sm_scale,
-            vmem_limit_bytes=None,
+            vmem_limit_bytes=_VISION_FLASH_VMEM_LIMIT_BYTES,
         )
 
     _jax_vision_flash.__annotations__ = {
