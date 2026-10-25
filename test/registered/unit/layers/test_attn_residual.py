@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -14,6 +13,7 @@ from sglang.srt.layers.attn_residual import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import enter_scope
 
@@ -58,11 +58,12 @@ class TestAggregateRegistry(unittest.TestCase):
     def setUp(self):
         enter_scope(self, patch.object(attn_residual, "_AGGREGATE_IMPLS", {}))
         enter_scope(self, patch.object(attn_residual, "_is_tpu", True))
+        # Only the dispatch key: layers resolve their forward method through
+        # the rest of the platform.
         enter_scope(
             self,
-            patch(
-                "sglang.srt.platforms.current_platform",
-                SimpleNamespace(get_dispatch_key_name=lambda: "test_plugin"),
+            patch.object(
+                current_platform, "get_dispatch_key_name", lambda: "test_plugin"
             ),
         )
         torch.manual_seed(0)
