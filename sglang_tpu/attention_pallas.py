@@ -468,6 +468,13 @@ class TpuPallasAttnBackend(AttentionBackend):
 # Vision encoder: non-causal flash attention with segment_ids
 # ---------------------------------------------------------------------------
 _VISION_FLASH_OPS: dict[float, object] = {}
+# Up to 92,800 keys the kernel runs one KV step over the whole sequence, so its
+# VMEM use grows with the key count: at 16,384 keys and 2+ local heads it needs
+# ~25 MiB on TPU7x, over a 24 MiB scoped limit. From there the op takes the full
+# VMEM, which a configured limit never exceeds; longer sequences need KV tiling
+# (block_k_major < kv_seq_len). Shorter calls keep the inherited limit, since
+# raising it there changed serving outputs (at bf16-noise level).
+_VISION_FLASH_FULL_VMEM_MIN_KEYS = 16384
 
 
 def _get_vision_flash_op(sm_scale: float):
@@ -480,10 +487,12 @@ def _get_vision_flash_op(sm_scale: float):
     from torch_tpu._internal import pallas
 
     def _jax_vision_flash(q, k, v, seg_ids):
-        # Distributed programs are traced on a CPU mesh, where get_tpu_info()
-        # raises; substitute the physical TPU metadata, as the GDN op does.
-        with tpu_info_for_cpu_export():
-            vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+        vmem_limit_bytes = None
+        if k.shape[2] >= _VISION_FLASH_FULL_VMEM_MIN_KEYS:
+            # Distributed programs are traced on a CPU mesh, where get_tpu_info()
+            # raises; substitute the physical TPU metadata, as the GDN op does.
+            with tpu_info_for_cpu_export():
+                vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
         return flash_attention(
             q,
             k,
@@ -491,11 +500,6 @@ def _get_vision_flash_op(sm_scale: float):
             segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
             causal=False,
             sm_scale=sm_scale,
-            # Up to 92,800 keys the kernel runs one KV step over the whole
-            # sequence, so its VMEM use grows with the patch count (~25 MiB at
-            # 16,384 patches with 2+ local heads on TPU7x). The full VMEM is never
-            # below a configured scoped limit; longer sequences need KV tiling
-            # (block_k_major < kv_seq_len).
             vmem_limit_bytes=vmem_limit_bytes,
         )
 
