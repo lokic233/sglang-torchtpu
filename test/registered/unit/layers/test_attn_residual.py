@@ -15,6 +15,7 @@ from sglang.srt.layers.attn_residual import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_scope
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -55,13 +56,14 @@ class TestAggregateRegistry(unittest.TestCase):
     T, H, NVB = 3, 1024, 2
 
     def setUp(self):
-        self.enterContext(patch.object(attn_residual, "_AGGREGATE_IMPLS", {}))
-        self.enterContext(patch.object(attn_residual, "_is_tpu", True))
-        self.enterContext(
+        enter_scope(self, patch.object(attn_residual, "_AGGREGATE_IMPLS", {}))
+        enter_scope(self, patch.object(attn_residual, "_is_tpu", True))
+        enter_scope(
+            self,
             patch(
                 "sglang.srt.platforms.current_platform",
                 SimpleNamespace(get_dispatch_key_name=lambda: "test_plugin"),
-            )
+            ),
         )
         torch.manual_seed(0)
         score_proj = ReplicatedLinear(self.H, 1, bias=False)
