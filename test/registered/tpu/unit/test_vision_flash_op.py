@@ -147,7 +147,6 @@ class TestVisionFlashOpWrapper(CustomTestCase):
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
 
 
-
 class TestVisionFlashRowsWrapper(CustomTestCase):
     """``rows=`` returns per-segment attention of the token-order inputs."""
 
@@ -183,7 +182,9 @@ class TestVisionFlashRowsWrapper(CustomTestCase):
         torch.manual_seed(1)
         s, h, d, scale = 48, 2, 16, 0.25
         q, k, v = (torch.randn(s, h, d) for _ in range(3))
-        seg = torch.tensor([(t % 12) // 4 + 3 * (t // 24) for t in range(s)], dtype=torch.int32)
+        seg = torch.tensor(
+            [(t % 12) // 4 + 3 * (t // 24) for t in range(s)], dtype=torch.int32
+        )
         attn = _CpuVisionAttn(d, h, scale)
         out = attn.forward(q, k, v, bsz=1, rows=_rows_layout(seg, 16))
         qr, kr, vr = (rearrange(x, "(b s) h d -> b h s d", b=1) for x in (q, k, v))
@@ -197,7 +198,14 @@ class TestVisionFlashRowsWrapper(CustomTestCase):
         q = torch.randn(8, 2, 16)
         rows = _rows_layout(torch.zeros(8, dtype=torch.int32), 8)
         with self.assertRaises(ValueError):
-            attn.forward(q, q, q, bsz=1, rows=rows, segment_ids=torch.zeros(1, 8, dtype=torch.int32))
+            attn.forward(
+                q,
+                q,
+                q,
+                bsz=1,
+                rows=rows,
+                segment_ids=torch.zeros(1, 8, dtype=torch.int32),
+            )
         with self.assertRaises(ValueError):
             attn.forward(q, q, q, bsz=2, rows=rows)
 

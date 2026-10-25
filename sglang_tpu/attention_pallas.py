@@ -569,9 +569,7 @@ def _get_vision_flash_rows_op(sm_scale: float):
     )
     op = pallas.jax_op(op_name, _jax_vision_flash_rows)
 
-    def _fake_vision_flash_rows(
-        q, k, v, row_index, row_segment_ids, inverse_index
-    ):
+    def _fake_vision_flash_rows(q, k, v, row_index, row_segment_ids, inverse_index):
         return torch.empty_like(q)
 
     op.register_fake(_fake_vision_flash_rows)
