@@ -665,6 +665,9 @@ class Envs:
     # --prefill-decode-interval does not defer prefill while no request is
     # decoding: there is nothing to interleave, so the deferral only idles.
     SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE = EnvBool(False)
+    # Decode steps before the next chunk of a prompt left mid-prefill; unset waits the full
+    # --prefill-decode-interval, so a long prompt's TTFT grows by one interval per chunk.
+    SGLANG_PREFILL_DECODE_INTERVAL_CHUNKED = EnvInt(None)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.

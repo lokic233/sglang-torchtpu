@@ -1358,6 +1358,10 @@ class Scheduler(
             envs.SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE.get()
             and not self.require_mlp_sync
         )
+        # Like skip-idle, a per-rank chunked request would split the DP cadence.
+        self.prefill_decode_interval_chunked = (
+            None if self.require_mlp_sync else envs.SGLANG_PREFILL_DECODE_INTERVAL_CHUNKED.get()
+        )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1434,7 +1438,12 @@ class Scheduler(
             else batch.forward_mode.is_extend()
         )
         if is_extend:
-            self._prefill_decode_interval_remaining = self.prefill_decode_interval
+            self._prefill_decode_interval_remaining = (
+                self.prefill_decode_interval_chunked
+                if self.prefill_decode_interval_chunked is not None
+                and self.chunked_req is not None
+                else self.prefill_decode_interval
+            )
 
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
