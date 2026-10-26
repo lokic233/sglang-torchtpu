@@ -27,7 +27,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
-from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKOnlyPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
@@ -140,15 +139,14 @@ def build_kv_host_pool(
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
-    # The MHA host-pool class is a platform decision (TPU substitutes its
-    # fused/raiden host pools); the platform default delegates to
-    # get_mha_host_pool_cls.
+    # The host-pool class is a platform decision; the platform defaults are the
+    # in-tree MHA (get_mha_host_pool_cls) and MLA host pools.
     from sglang.srt.platforms import current_platform
 
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
     kv_host_pool_cls = (
-        MLATokenToKVPoolHost
+        current_platform.get_mla_kv_pool_host_cls(kv_pool)
         if use_mla
         else current_platform.get_mha_kv_pool_host_cls(kv_pool)
     )
@@ -1197,7 +1195,9 @@ def build_hybrid_mamba_stack(
         if get_memory().hicache_mem_layout == "page_first_kv_split"
         else get_memory().hicache_mem_layout
     )
-    mamba_host_pool = MambaPoolHost(
+    from sglang.srt.platforms import current_platform
+
+    mamba_host_pool = current_platform.get_mamba_pool_host_cls(mamba_pool)(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
@@ -1243,7 +1243,7 @@ def build_hybrid_mamba_stack(
             )
         )
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = HybridCacheController.create_for_backend(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         params.page_size,
@@ -1319,7 +1319,9 @@ def build_hybrid_mamba_swa_stack(
         host_size=swa_host_size,
         pool_label="swa",
     )
-    mamba_host_pool = MambaPoolHost(
+    from sglang.srt.platforms import current_platform
+
+    mamba_host_pool = current_platform.get_mamba_pool_host_cls(mamba_pool)(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
@@ -1366,7 +1368,7 @@ def build_hybrid_mamba_swa_stack(
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = HybridCacheController.create_for_backend(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         page_size,

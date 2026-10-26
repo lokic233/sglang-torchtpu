@@ -289,6 +289,7 @@ class TestDirectBackendTranslation(unittest.TestCase):
 class TestTriPoolAssembly(unittest.TestCase):
     def test_swa_allocation_and_rollback_match_pool_id_ownership(self):
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+        from sglang.srt.platforms import current_platform
 
         for unified in (False, True):
             with self.subTest(unified=unified):
@@ -312,7 +313,11 @@ class TestTriPoolAssembly(unittest.TestCase):
                         assembler, "_get_allocator_type", return_value="default"
                     ),
                     patch.object(assembler, "build_kv_host_pool", return_value=host),
-                    patch.object(assembler, "MambaPoolHost", return_value=host),
+                    patch.object(
+                        current_platform,
+                        "get_mamba_pool_host_cls",
+                        return_value=Mock(return_value=host),
+                    ),
                     patch.object(assembler, "HybridCacheController"),
                 ):
                     group, _ = assembler.build_hybrid_mamba_swa_stack(
