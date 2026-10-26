@@ -591,6 +591,13 @@ def _register_attention_backends() -> None:
 
         return DSV4TPUAttnBackend(runner)
 
+    # Vision: the "tpu" backend also takes a rows layout for segment-local
+    # layers; without one it is VisionTpuAttention unchanged.
+    from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
+    from sglang_tpu.attention.vision_rows import VisionTpuRowsAttention
+
+    QKV_BACKEND_IMPL["tpu"] = VisionTpuRowsAttention
+
 
 def _register_models() -> None:
     """Add the model implementations that only this package provides to the registry."""
