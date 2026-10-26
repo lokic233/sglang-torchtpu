@@ -184,10 +184,12 @@ def _get(url: str, token: str, raw: bool = False):
     return body.decode("utf-8", "replace") if raw else json.loads(body)
 
 
-def collect(token: str, runs_per_workflow: int) -> Dict[str, List[int]]:
+def collect(
+    token: str, runs_per_workflow: int, workflows: Iterable[str] = WORKFLOWS
+) -> Dict[str, List[int]]:
     api = f"https://api.github.com/repos/{REPO}/actions"
     samples: Dict[str, List[int]] = defaultdict(list)
-    for wf in WORKFLOWS:
+    for wf in workflows:
         runs = _get(
             f"{api}/workflows/{wf}/runs?branch=main&event=schedule"
             f"&status=completed&per_page={runs_per_workflow}",
@@ -235,6 +237,7 @@ def plan(
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--runs", type=int, default=15, help="recent runs per workflow")
+    ap.add_argument("--workflows", nargs="+", default=WORKFLOWS, help="workflow files")
     ap.add_argument("--root", default=".", help="repo root to rewrite")
     ap.add_argument("--only", nargs="*", default=(), help="limit to these paths")
     ap.add_argument("--dry-run", action="store_true")
@@ -248,7 +251,7 @@ def main() -> int:
         token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
         if not token:
             sys.exit("GITHUB_TOKEN (or GH_TOKEN) is required to read run logs")
-        samples = collect(token, a.runs)
+        samples = collect(token, a.runs, a.workflows)
         if a.samples:
             Path(a.samples).write_text(json.dumps(samples, indent=1, sort_keys=True))
 
