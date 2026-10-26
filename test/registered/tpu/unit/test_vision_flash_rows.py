@@ -24,6 +24,7 @@ import unittest
 import torch
 from einops import rearrange
 
+from sglang.srt.utils import is_tpu
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention.vision_rows import VisionAttentionRows, VisionTpuRowsAttention
 
@@ -222,9 +223,17 @@ class TestVisionFlashRowsJax(CustomTestCase):
         self._check(_tiles(32, 32, 8, 16), row_len=256, h=2, d=16, seed=1)
 
 
-@unittest.skipUnless(
-    hasattr(torch, "accelerator") and torch.accelerator.is_available(), "requires TPU"
-)
+def _tpu_available() -> bool:
+    """The TPU platform (what VisionTpuAttention requires) with a usable device.
+
+    torch.accelerator alone is also true on CUDA hosts.
+    """
+    return (
+        is_tpu() and hasattr(torch, "accelerator") and torch.accelerator.is_available()
+    )
+
+
+@unittest.skipUnless(_tpu_available(), "requires the TPU platform and a TPU device")
 class TestVisionFlashRowsOnTpu(CustomTestCase):
     """The registered Pallas op in bf16, eager and compiled, against fp32 on the CPU."""
 
