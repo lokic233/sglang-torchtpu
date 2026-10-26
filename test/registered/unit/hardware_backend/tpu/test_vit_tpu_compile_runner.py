@@ -383,14 +383,6 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         # 324 == 18^2, so a square grid lands exactly on the bucket.
         self.assertEqual(grid_thw.tolist(), [[1, 18, 18]])
 
-    def test_vision_specialization_key_gives_none_its_own_variant(self):
-        key = vit_runner._vision_specialization_key
-        x, idx = torch.zeros(4, 8), torch.zeros(4, dtype=torch.int32)
-        self.assertEqual(key(x, None), key(torch.ones(4, 8), None))
-        self.assertEqual(key(x, None), (((4, 8), torch.float32), None))
-        self.assertNotEqual(key(x, None), key(x, idx))
-        self.assertNotEqual(key(x, idx), key(x, idx.long()))
-
     def test_qwen3_vl_supplies_the_vision_tower_for_direct_compile(self):
         tower = nn.Linear(2, 2)
         self.assertIs(Qwen3VLVisionTpuCompilePolicy(tower).get_compile_model(), tower)

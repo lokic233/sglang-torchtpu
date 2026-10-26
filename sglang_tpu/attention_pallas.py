@@ -18,7 +18,6 @@ this module is adapted from (https://github.com/vllm-project/vllm-torchtpu/tree/
 
 from __future__ import annotations
 
-import functools
 from typing import TYPE_CHECKING
 
 import jax
@@ -26,6 +25,12 @@ import jax.numpy as jnp
 import torch
 from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel import (
     paged_attention,
+)
+from jax.experimental.pallas.ops.tpu.splash_attention import (
+    splash_attention_kernel as splash,
+)
+from jax.experimental.pallas.ops.tpu.splash_attention import (
+    splash_attention_mask_info as splash_mask_info,
 )
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -510,92 +515,118 @@ def _get_vision_flash_op(sm_scale: float):
 
 
 # ---------------------------------------------------------------------------
-# Vision encoder: segment-local attention over gathered rows
+# Vision encoder: segment-local attention with block skipping (splash)
 # ---------------------------------------------------------------------------
-_VISION_FLASH_ROWS_OPS: dict[float, object] = {}
+_VISION_LOCAL_OPS: dict[float, object] = {}
 
 
-def _vision_flash_rows(
-    q,
-    k,
-    v,
-    row_index,
-    row_segment_ids,
-    inverse_index,
-    *,
-    sm_scale: float,
-    attention=None,
-):
-    """Segment-local attention over gathered rows; the JAX body of the rows op.
+def _vision_local_block_sizes(seq_len: int) -> tuple[int, int]:
+    """Splash (block_q, block_kv) for a sequence: the largest of 2048 / 1024 dividing it.
 
-    q, k, v: [seq_len, num_heads, head_dim], token-major. Gathers the tokens into
-    rows by ``row_index``, runs ``attention`` per row with ``row_segment_ids``, and
-    gathers the outputs back to token order by ``inverse_index``. ``attention``
-    defaults to the Pallas kernel; tests pass a reference with the same signature.
+    Large blocks keep the per-grid-step cost low; at 16,384 tokens with 1,024-token
+    segments, (2048, 1024) measured fastest of the sizes that fit a 24 MiB scoped VMEM.
     """
-    if attention is None:
-        attention = functools.partial(flash_attention, vmem_limit_bytes=None)
-    num_rows, row_len = row_segment_ids.shape
-    _, num_heads, head_dim = q.shape
+    block_q = next(b for b in (2048, 1024, 512, 256, 128) if seq_len % b == 0)
+    block_kv = next(b for b in (1024, 512, 256, 128) if seq_len % b == 0)
+    return block_q, block_kv
 
-    def to_rows(x):
-        # Pad slots may hold any index; clamping keeps their gather finite (the
-        # default fill is NaN, which the kernel's additive mask would not remove).
-        x = jnp.take(x, row_index, axis=0, mode="clip")
-        return x.reshape(num_rows, row_len, num_heads, head_dim).transpose(0, 2, 1, 3)
 
-    out = attention(
-        to_rows(q),
-        to_rows(k),
-        to_rows(v),
-        segment_ids=SegmentIds(q=row_segment_ids, kv=row_segment_ids),
-        causal=False,
-        sm_scale=sm_scale,
+def _vision_local_block_map(segment_ids, block_q: int, block_kv: int):
+    """Splash block map for segment-local attention: (block_mask, data_next), [1, nq, nkv].
+
+    A (q block, kv block) pair is live when the segment-id ranges of the two blocks
+    intersect. That holds whenever any query in the q block shares a segment with any
+    key in the kv block, so skipping the other pairs is exact for any token order; the
+    map is sparse when each segment is contiguous. ``data_next`` is the kv block a grid
+    step fetches: the last live block so far (the first live one before it), so a
+    skipped step fetches nothing new.
+    """
+    q_ids = segment_ids.reshape(-1, block_q)
+    kv_ids = segment_ids.reshape(-1, block_kv)
+    live = (q_ids.min(1)[:, None] <= kv_ids.max(1)[None, :]) & (
+        kv_ids.min(1)[None, :] <= q_ids.max(1)[:, None]
     )
-    out = out.transpose(0, 2, 1, 3).reshape(num_rows * row_len, num_heads, head_dim)
-    return jnp.take(out, inverse_index, axis=0)
+    kv_block = jnp.arange(live.shape[1], dtype=jnp.int32)
+    last_live = jax.lax.cummax(jnp.where(live, kv_block, -1), axis=1)
+    first_live = jnp.argmax(live, axis=1).astype(jnp.int32)
+    data_next = jnp.where(last_live >= 0, last_live, first_live[:, None])
+    block_mask = jnp.where(live, 2, 0).astype(jnp.int32)
+    return block_mask[None], data_next[None]
 
 
-def _get_vision_flash_rows_op(sm_scale: float):
-    """Return a cached pallas op for segment-local vision attention over gathered rows.
+def _vision_local_attention(q, k, v, segment_ids, *, sm_scale: float, interpret=False):
+    """Segment-local attention with block skipping; the JAX body of the local op.
 
-    When every segment is short (local windows or tiles), the segment-ID op above
-    still computes every query-key block of the whole sequence and masks most of
-    them away. This op gathers each segment's tokens into fixed-length rows
-    (several short segments may share a row), runs flash attention per row with
-    per-slot segment IDs, and gathers the outputs back to token order. It costs
-    ``num_rows * row_len**2`` instead of ``seq_len**2``.
+    q, k, v: [seq_len, num_heads, head_dim], token-major; segment_ids: [seq_len]. Runs
+    splash attention with the block map of ``_vision_local_block_map`` and the segment
+    ids as the in-block mask. Splash takes no softmax scale, so q is scaled first.
+    """
+    block_q, block_kv = _vision_local_block_sizes(q.shape[0])
+    block_mask, data_next = _vision_local_block_map(segment_ids, block_q, block_kv)
+    mask_info = splash_mask_info.MaskInfo(
+        data_next=data_next,
+        mask_next=None,
+        block_mask=block_mask,
+        partial_mask_blocks=None,
+        q_sequence=None,
+        is_dynamic_mask=True,
+    )
+    kernel = splash.SplashAttentionKernel(
+        mask_info,
+        None,
+        None,
+        block_sizes=splash.BlockSizes(
+            block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv
+        ),
+        is_mqa=False,
+        save_residuals=False,
+        mask_value=splash.DEFAULT_MASK_VALUE,
+        attn_logits_soft_cap=None,
+        residual_checkpoint_name=None,
+        mask_function=None,
+        interpret=interpret,
+    )
+    out = kernel(
+        (q * sm_scale).transpose(1, 0, 2),
+        k.transpose(1, 0, 2),
+        v.transpose(1, 0, 2),
+        segment_ids=splash.SegmentIds(q=segment_ids, kv=segment_ids),
+    )
+    return out.transpose(1, 0, 2)
+
+
+def _get_vision_local_op(sm_scale: float):
+    """Return a cached pallas op for segment-local vision attention with block skipping.
+
+    For segments much shorter than the sequence (local windows or tiles), the
+    segment-ID op above computes every query-key block and masks most of them. This
+    op skips the blocks whose segments cannot meet, so with each segment contiguous
+    its cost scales with the segment lengths rather than ``seq_len**2``.
     """
     key = float(sm_scale)
-    op = _VISION_FLASH_ROWS_OPS.get(key)
+    op = _VISION_LOCAL_OPS.get(key)
     if op is not None:
         return op
 
     from torch_tpu._internal import pallas
 
-    def _jax_vision_flash_rows(q, k, v, row_index, row_segment_ids, inverse_index):
-        return _vision_flash_rows(
-            q, k, v, row_index, row_segment_ids, inverse_index, sm_scale=sm_scale
-        )
+    def _jax_vision_local(q, k, v, segment_ids):
+        return _vision_local_attention(q, k, v, segment_ids, sm_scale=sm_scale)
 
-    _jax_vision_flash_rows.__annotations__ = {
+    _jax_vision_local.__annotations__ = {
         "q": jax.Array,
         "k": jax.Array,
         "v": jax.Array,
-        "row_index": jax.Array,
-        "row_segment_ids": jax.Array,
-        "inverse_index": jax.Array,
+        "segment_ids": jax.Array,
         "return": jax.Array,
     }
 
-    op_name = f"sglang_tpu::vision_flash_rows_s{key!r}".replace(".", "_").replace(
-        "-", "m"
-    )
-    op = pallas.jax_op(op_name, _jax_vision_flash_rows)
+    op_name = f"sglang_tpu::vision_local_s{key!r}".replace(".", "_").replace("-", "m")
+    op = pallas.jax_op(op_name, _jax_vision_local)
 
-    def _fake_vision_flash_rows(q, k, v, row_index, row_segment_ids, inverse_index):
+    def _fake_vision_local(q, k, v, segment_ids):
         return torch.empty_like(q)
 
-    op.register_fake(_fake_vision_flash_rows)
-    _VISION_FLASH_ROWS_OPS[key] = op
+    op.register_fake(_fake_vision_local)
+    _VISION_LOCAL_OPS[key] = op
     return op

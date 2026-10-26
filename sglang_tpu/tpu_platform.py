@@ -591,12 +591,12 @@ def _register_attention_backends() -> None:
 
         return DSV4TPUAttnBackend(runner)
 
-    # Vision: the "tpu" backend also takes a rows layout for segment-local
-    # layers; without one it is VisionTpuAttention unchanged.
+    # Vision: the "tpu" backend also runs segment-local layers with block
+    # skipping; without local_segment_ids it is VisionTpuAttention unchanged.
     from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
-    from sglang_tpu.attention.vision_rows import VisionTpuRowsAttention
+    from sglang_tpu.attention.vision_local import VisionTpuLocalAttention
 
-    QKV_BACKEND_IMPL["tpu"] = VisionTpuRowsAttention
+    QKV_BACKEND_IMPL["tpu"] = VisionTpuLocalAttention
 
 
 def _register_models() -> None:
