@@ -18,6 +18,7 @@ this module is adapted from (https://github.com/vllm-project/vllm-torchtpu/tree/
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
 
 import jax
@@ -514,6 +515,45 @@ def _get_vision_flash_op(sm_scale: float):
 _VISION_FLASH_ROWS_OPS: dict[float, object] = {}
 
 
+def _vision_flash_rows(
+    q,
+    k,
+    v,
+    row_index,
+    row_segment_ids,
+    inverse_index,
+    *,
+    sm_scale: float,
+    attention=None,
+):
+    """Segment-local attention over gathered rows; the JAX body of the rows op.
+
+    q, k, v: [seq_len, num_heads, head_dim], token-major. Gathers the tokens into
+    rows by ``row_index``, runs ``attention`` per row with ``row_segment_ids``, and
+    gathers the outputs back to token order by ``inverse_index``. ``attention``
+    defaults to the Pallas kernel; tests pass a reference with the same signature.
+    """
+    if attention is None:
+        attention = functools.partial(flash_attention, vmem_limit_bytes=None)
+    num_rows, row_len = row_segment_ids.shape
+    _, num_heads, head_dim = q.shape
+
+    def to_rows(x):
+        x = jnp.take(x, row_index, axis=0)
+        return x.reshape(num_rows, row_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+
+    out = attention(
+        to_rows(q),
+        to_rows(k),
+        to_rows(v),
+        segment_ids=SegmentIds(q=row_segment_ids, kv=row_segment_ids),
+        causal=False,
+        sm_scale=sm_scale,
+    )
+    out = out.transpose(0, 2, 1, 3).reshape(num_rows * row_len, num_heads, head_dim)
+    return jnp.take(out, inverse_index, axis=0)
+
+
 def _get_vision_flash_rows_op(sm_scale: float):
     """Return a cached pallas op for segment-local vision attention over gathered rows.
 
@@ -532,27 +572,9 @@ def _get_vision_flash_rows_op(sm_scale: float):
     from torch_tpu._internal import pallas
 
     def _jax_vision_flash_rows(q, k, v, row_index, row_segment_ids, inverse_index):
-        # q, k, v: [seq_len, num_heads, head_dim], token-major.
-        num_rows, row_len = row_segment_ids.shape
-        _, num_heads, head_dim = q.shape
-
-        def to_rows(x):
-            x = jnp.take(x, row_index, axis=0)
-            return x.reshape(num_rows, row_len, num_heads, head_dim).transpose(
-                0, 2, 1, 3
-            )
-
-        out = flash_attention(
-            to_rows(q),
-            to_rows(k),
-            to_rows(v),
-            segment_ids=SegmentIds(q=row_segment_ids, kv=row_segment_ids),
-            causal=False,
-            sm_scale=sm_scale,
-            vmem_limit_bytes=None,
+        return _vision_flash_rows(
+            q, k, v, row_index, row_segment_ids, inverse_index, sm_scale=sm_scale
         )
-        out = out.transpose(0, 2, 1, 3).reshape(num_rows * row_len, num_heads, head_dim)
-        return jnp.take(out, inverse_index, axis=0)
 
     _jax_vision_flash_rows.__annotations__ = {
         "q": jax.Array,

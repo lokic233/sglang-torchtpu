@@ -193,6 +193,17 @@ class TestVisionFlashRowsWrapper(CustomTestCase):
         )
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
 
+    def test_rows_reject_bad_layout_shapes(self):
+        attn = _CpuVisionAttn(16, 2, 0.25)
+        q = torch.randn(8, 2, 16)
+        rows = _rows_layout(torch.zeros(8, dtype=torch.int32), 8)
+        short_inverse = rows._replace(inverse_index=rows.inverse_index[:4])
+        with self.assertRaises(ValueError):
+            attn.forward(q, q, q, bsz=1, rows=short_inverse)
+        short_index = rows._replace(row_index=rows.row_index[:4])
+        with self.assertRaises(ValueError):
+            attn.forward(q, q, q, bsz=1, rows=short_index)
+
     def test_rows_reject_other_masks(self):
         attn = _CpuVisionAttn(16, 2, 0.25)
         q = torch.randn(8, 2, 16)
@@ -208,6 +219,57 @@ class TestVisionFlashRowsWrapper(CustomTestCase):
             )
         with self.assertRaises(ValueError):
             attn.forward(q, q, q, bsz=2, rows=rows)
+
+
+class TestVisionFlashRowsJax(CustomTestCase):
+    """The JAX body of the rows op (gather, per-row attention, inverse gather),
+    with the Pallas kernel swapped for the JAX reference attention, returns the
+    per-segment attention of the token-order inputs."""
+
+    def _check(self, seg, row_len, h, d, seed):
+        import jax.numpy as jnp
+        import numpy as np
+
+        from sglang_tpu.attention_pallas import _vision_flash_rows
+        from sglang_tpu.kernels.flash_attention import mha_reference
+
+        def reference_attention(q, k, v, *, segment_ids, causal, sm_scale):
+            return mha_reference(
+                q, k, v, None, segment_ids=segment_ids, causal=causal, sm_scale=sm_scale
+            )
+
+        torch.manual_seed(seed)
+        s, scale = seg.shape[0], 1.0 / math.sqrt(d)
+        q, k, v = (torch.randn(s, h, d) for _ in range(3))
+        rows = _rows_layout(seg, row_len)
+        out = _vision_flash_rows(
+            *(jnp.asarray(x.numpy()) for x in (q, k, v)),
+            *(jnp.asarray(x.numpy()) for x in rows),
+            sm_scale=scale,
+            attention=reference_attention,
+        )
+        qr, kr, vr = (rearrange(x, "(b s) h d -> b h s d", b=1) for x in (q, k, v))
+        ref = rearrange(
+            _ref_segment_attention(qr, kr, vr, seg[None], scale), "b h s d -> (b s) h d"
+        )
+        torch.testing.assert_close(
+            torch.from_numpy(np.asarray(out)), ref, atol=1e-4, rtol=1e-4
+        )
+
+    def test_segments_share_rows_with_padding(self):
+        seg = torch.cat(
+            [
+                torch.full((n,), i, dtype=torch.int32)
+                for i, n in enumerate([20, 7, 13, 32, 5, 1])
+            ]
+        )
+        self._check(seg, row_len=32, h=4, d=32, seed=3)
+
+    def test_interleaved_segments(self):
+        seg = torch.tensor(
+            [(t % 12) // 4 + 3 * (t // 24) for t in range(48)], dtype=torch.int32
+        )
+        self._check(seg, row_len=16, h=2, d=16, seed=1)
 
 
 if __name__ == "__main__":
