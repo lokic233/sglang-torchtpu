@@ -689,7 +689,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
         self.assertEqual(tuple(result.shape), (6, 1, 4))
         segment_ids = flash_op.call_args.args[-1]
-        self.assertEqual(tuple(segment_ids.shape), (2, VisionTpuAttention._BLOCK_SIZE))
+        self.assertEqual(tuple(segment_ids.shape), (2, 128))
         self.assertEqual(segment_ids[:, :3].tolist(), [[0, 0, 0], [0, 0, 0]])
         self.assertTrue(torch.all(segment_ids[:, 3:] == 1))
 

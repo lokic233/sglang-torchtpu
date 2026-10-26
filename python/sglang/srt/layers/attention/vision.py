@@ -1082,10 +1082,7 @@ def _build_tpu_segment_ids(
 
 
 class VisionTpuAttention(nn.Module):
-    # Sequences are padded to 1,024 so the flash op always gets 512-row query blocks
-    # and KV blocks of at least 1,024 keys; smaller tiles are much slower (see
-    # sglang_tpu.attention_pallas._vision_flash_block_sizes).
-    _BLOCK_SIZE = 1024
+    _BLOCK_SIZE = 128
     supports_segment_ids = True
 
     def __init__(

@@ -18,10 +18,10 @@ this module is adapted from (https://github.com/vllm-project/vllm-torchtpu/tree/
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import torch
 from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel import (
     paged_attention,
@@ -470,27 +470,64 @@ class TpuPallasAttnBackend(AttentionBackend):
 _VISION_FLASH_OPS: dict[float, object] = {}
 
 
-def _vision_flash_block_sizes(seq_len: int) -> BlockSizes:
-    """Flash block sizes for the vision op; ``seq_len`` must be a multiple of 1,024.
+# The vision op keeps the kernel's default single KV step wherever it compiles
+# under a 24 MiB scoped VMEM limit, so outputs and speed there are unchanged. On
+# TPU7x (head_dim 72 and 96) that is up to 15,872 keys at every head count, and up
+# to 20,480 keys with one local head (whose K/V blocks are single-buffered).
+# Beyond that its VMEM, which grows with the sequence, runs out, and the op pads
+# to a multiple of 4,096 and tiles the KV sequence instead.
+_VISION_FLASH_SINGLE_STEP_MAX_KEYS = 15872
+_VISION_FLASH_SINGLE_STEP_MAX_KEYS_ONE_HEAD = 20480
+_VISION_FLASH_TILE_MULTIPLE = 4096
+# Tiled blocks. Only large tiles keep tiling fast: on TPU7x 128-row query blocks
+# are 4-17x slower than the single step, and 1,024- and 2,048-key KV blocks up to
+# 40% and 9% slower, while these are 6-13% faster at the same length.
+_VISION_FLASH_TILED_BLOCKS = BlockSizes(
+    block_q=512, block_k_major=4096, block_k=1024, block_b=1
+)
 
-    The kernel's default runs one KV step over the whole sequence up to 92,800
-    keys, so its VMEM use grows with the sequence: on TPU7x, 16,384 keys with 2+
-    local heads exceed a 24 MiB scoped limit. Tiling the KV sequence bounds VMEM
-    by the block sizes instead, but only large tiles keep it fast: 128-row query
-    blocks are 4-17x slower than the single step and 512-key KV blocks up to
-    1.7x slower. So ``VisionTpuAttention`` pads to a multiple of 1,024, and the KV
-    block is the largest of 1,024 / 2,048 / 4,096 that divides the sequence.
+
+def _vision_flash_tiles(seq_len: int, num_heads: int) -> bool:
+    """Whether the vision op tiles (vs the single KV step) for this shape."""
+    if num_heads == 1:
+        return seq_len > _VISION_FLASH_SINGLE_STEP_MAX_KEYS_ONE_HEAD
+    return seq_len > _VISION_FLASH_SINGLE_STEP_MAX_KEYS
+
+
+def _vision_flash(q, k, v, seg_ids, *, sm_scale: float, attention=flash_attention):
+    """Non-causal segment-masked attention; the JAX body of the vision op.
+
+    q, k, v: [batch, heads, seq, head_dim]; seg_ids: [batch, seq]. Shapes that
+    ``_vision_flash_tiles`` keeps on the single KV step call the kernel exactly as
+    before. Others are padded to a multiple of 4,096 (pad tokens get their own
+    segment), tiled with ``_VISION_FLASH_TILED_BLOCKS``, and sliced back; the
+    tiled kernel needs head_dim <= 128 or a multiple of 128. ``attention`` is the
+    Pallas kernel; tests pass a reference with the same keyword arguments.
     """
-    if seq_len % 1024:
-        raise ValueError(
-            f"vision flash attention needs a multiple of 1,024 tokens, got {seq_len}"
-        )
-    return BlockSizes(
-        block_q=512,
-        block_k_major=math.gcd(seq_len, 4096),
-        block_k=1024,
-        block_b=1,
+    _, num_heads, seq_len, _ = q.shape
+    block_sizes = None
+    pad = 0
+    if _vision_flash_tiles(seq_len, num_heads):
+        block_sizes = _VISION_FLASH_TILED_BLOCKS
+        pad = (-seq_len) % _VISION_FLASH_TILE_MULTIPLE
+        if pad:
+            widths = ((0, 0), (0, 0), (0, pad), (0, 0))
+            q, k, v = (jnp.pad(x, widths) for x in (q, k, v))
+            pad_ids = jnp.full(
+                (seg_ids.shape[0], pad), jnp.max(seg_ids) + 1, seg_ids.dtype
+            )
+            seg_ids = jnp.concatenate([seg_ids, pad_ids], axis=1)
+    out = attention(
+        q,
+        k,
+        v,
+        segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
+        causal=False,
+        sm_scale=sm_scale,
+        block_sizes=block_sizes,
+        vmem_limit_bytes=None,
     )
+    return out[:, :, :seq_len, :] if pad else out
 
 
 def _get_vision_flash_op(sm_scale: float):
@@ -503,16 +540,7 @@ def _get_vision_flash_op(sm_scale: float):
     from torch_tpu._internal import pallas
 
     def _jax_vision_flash(q, k, v, seg_ids):
-        return flash_attention(
-            q,
-            k,
-            v,
-            segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
-            causal=False,
-            sm_scale=sm_scale,
-            block_sizes=_vision_flash_block_sizes(k.shape[2]),
-            vmem_limit_bytes=None,
-        )
+        return _vision_flash(q, k, v, seg_ids, sm_scale=sm_scale)
 
     _jax_vision_flash.__annotations__ = {
         "q": jax.Array,
