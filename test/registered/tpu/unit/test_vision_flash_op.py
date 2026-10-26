@@ -103,42 +103,5 @@ class TestVisionFlashOpWrapper(CustomTestCase):
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
 
 
-class TestVisionFlashBlockSizes(CustomTestCase):
-    """``flash_block_sizes`` pads the sequence to the kernel's tile; the default
-    keeps 128-token padding."""
-
-    def _run(self, s, block_sizes, h=2, d=16):
-        torch.manual_seed(0)
-        scale = 1.0 / math.sqrt(d)
-        q, k, v = (torch.randn(s, h, d) for _ in range(3))
-        seg = torch.zeros(1, s, dtype=torch.int32)
-        seg[0, s // 3 :] = 1
-        attn = _CpuVisionAttn(d, h, scale)
-        attn._flash_block_sizes = block_sizes
-        seen = []
-
-        def flash_op(q, k, v, seg_ids):
-            seen.append(tuple(seg_ids.shape))
-            return _ref_segment_attention(q, k, v, seg_ids, scale)
-
-        attn._flash_op = flash_op
-        out = attn.forward(q, k, v, bsz=1, segment_ids=seg.clone())
-        qr, kr, vr = (rearrange(x, "(b s) h d -> b h s d", b=1) for x in (q, k, v))
-        ref = rearrange(
-            _ref_segment_attention(qr, kr, vr, seg, scale), "b h s d -> (b s) h d"
-        )
-        torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
-        return seen
-
-    def test_default_pads_to_128(self):
-        self.assertEqual(self._run(1100, None), [(1, 1152)])
-
-    def test_explicit_blocks_pad_to_the_tile(self):
-        from sglang_tpu.kernels.flash_attention import BlockSizes
-
-        blocks = BlockSizes(block_q=512, block_k_major=4096, block_k=1024, block_b=1)
-        self.assertEqual(self._run(1100, blocks), [(1, 4096)])
-
-
 if __name__ == "__main__":
     unittest.main()

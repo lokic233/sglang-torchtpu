@@ -472,17 +472,9 @@ _VISION_FLASH_OPS: dict[tuple, object] = {}
 def _get_vision_flash_op(sm_scale: float, block_sizes: BlockSizes | None = None):
     """Return a cached pallas op for non-causal flash attention with segment IDs.
 
-    ``block_sizes=None`` keeps the kernel's default, which up to 92,800 keys is
-    one KV step over the whole sequence, so its VMEM use grows with the sequence
-    (on TPU7x, 16,384 keys with 2+ local heads exceed a 24 MiB scoped limit).
-    Callers with long sequences can pass explicit blocks to tile the KV sequence,
-    which bounds VMEM by the blocks. ``VisionTpuAttention`` pads the sequence to
-    a multiple of ``block_q`` and ``block_k_major``; lengths that already are one
-    avoid that padding work. Use large tiles: on TPU7x (head_dim 72 and
-    96), ``BlockSizes(block_q=512, block_k_major=4096, block_k=1024, block_b=1)``
-    is 6-13% faster than the single step, while 128-row query blocks are 4-17x
-    slower and 1,024-key KV blocks about 40% slower. The tiled kernel needs
-    head_dim <= 128 or a multiple of 128.
+    ``block_sizes=None`` keeps the kernel's default (one KV step over the whole
+    sequence up to 92,800 keys); explicit blocks tile the KV sequence. See
+    ``sglang_tpu.attention.vision_tiled``.
     """
     key = (float(sm_scale), block_sizes)
     op = _VISION_FLASH_OPS.get(key)

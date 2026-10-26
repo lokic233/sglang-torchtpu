@@ -1084,9 +1084,6 @@ def _build_tpu_segment_ids(
 class VisionTpuAttention(nn.Module):
     _BLOCK_SIZE = 128
     supports_segment_ids = True
-    # Explicit flash block sizes (sglang_tpu.kernels.flash_attention.BlockSizes);
-    # None keeps the kernel's default. See _get_vision_flash_op.
-    _flash_block_sizes = None
 
     def __init__(
         self,
@@ -1097,7 +1094,6 @@ class VisionTpuAttention(nn.Module):
         flatten_batch=False,
         softmax_in_single_precision=False,
         softmax_scale=None,
-        flash_block_sizes=None,
         **kwargs,
     ):
         super().__init__()
@@ -1110,8 +1106,7 @@ class VisionTpuAttention(nn.Module):
         self.scale = (
             softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
         )
-        self._flash_block_sizes = flash_block_sizes
-        self._flash_op = _get_vision_flash_op(float(self.scale), flash_block_sizes)
+        self._flash_op = _get_vision_flash_op(float(self.scale))
         self._sdpa_fallback = VisionSdpaAttention(
             head_dim=head_dim,
             num_heads=num_heads,
@@ -1121,13 +1116,6 @@ class VisionTpuAttention(nn.Module):
             softmax_in_single_precision=softmax_in_single_precision,
             softmax_scale=softmax_scale,
         )
-
-    def _pad_multiple(self) -> int:
-        """The sequence multiple the flash kernel needs: its blocks must divide it."""
-        b = self._flash_block_sizes
-        if b is None:
-            return self._BLOCK_SIZE
-        return math.lcm(self._BLOCK_SIZE, b.block_q, b.block_k_major)
 
     def forward(
         self,
@@ -1177,7 +1165,7 @@ class VisionTpuAttention(nn.Module):
         else:
             segment_ids = segment_ids.to(device=q.device, dtype=torch.int32)
         q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
-        pad = (-s) % self._pad_multiple()
+        pad = (-s) % self._BLOCK_SIZE
         if pad > 0:
             q = F.pad(q, (0, 0, 0, pad))
             k = F.pad(k, (0, 0, 0, pad))
