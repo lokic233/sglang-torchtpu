@@ -663,10 +663,9 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
                         call()
 
 
-class TestBatchGateCounterLayerWait(CustomTestCase):
-    def test_layer_wait_gates_eager_callers_only(self):
-        """Recurrent-state pools wait per layer through wait_until; the batch
-        counter must honor it eagerly and stay out of a compiled forward."""
+class TestRecurrentStateGate(CustomTestCase):
+    def test_layer_wait_waits_for_the_batch(self):
+        """Eager state copies on a prefix hit wait per layer through wait_until."""
         from sglang_tpu.tpu_dma_hybrid_cache_controller import BatchGateCounter
 
         counter = BatchGateCounter()
@@ -675,9 +674,24 @@ class TestBatchGateCounterLayerWait(CustomTestCase):
         counter.set_consumer(0)
         counter.wait_until(3)
         event.synchronize.assert_called_once()
-        with patch.object(torch.compiler, "is_compiling", return_value=True):
-            counter.wait_until(3)
-        event.synchronize.assert_called_once()
+
+    def test_backend_state_read_never_touches_the_transfer_counter(self):
+        """The compiled forward reads state through _layer_state; consulting the
+        offload counter there guards the graph on it, so registering the counter
+        after warmup recompiles every graph at serve time."""
+        from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
+
+        class _Pool:
+            mamba_map = {7: 2}
+            mamba_pool = SimpleNamespace(mamba2_layer_cache=lambda i: ("state", i))
+
+            @property
+            def layer_transfer_counter(self):
+                raise AssertionError("read the HiCache counter")
+
+        backend = object.__new__(TpuGDNAttnBackend)
+        backend.req_to_token_pool = _Pool()
+        self.assertEqual(backend._layer_state(7), ("state", 2))
 
 
 class TestDraftSidecar(CustomTestCase):

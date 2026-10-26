@@ -61,11 +61,9 @@ class BatchGateCounter(BatchDoneCounter):
     accessors call once the counter is registered on the req-to-token pool."""
 
     def wait_until(self, threshold: int) -> None:
-        # Inside a compiled forward the whole batch already waited before
-        # launch, and branching on the slot would guard the graph on it.
+        # The whole batch lands at once; the TPU backends read state without it.
         del threshold
-        if not torch.compiler.is_compiling():
-            self.wait()
+        self.wait()
 
 
 class TpuDMAHybridCacheController(HybridCacheController):
