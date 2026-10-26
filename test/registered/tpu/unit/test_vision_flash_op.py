@@ -19,7 +19,6 @@ register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 import math
 import unittest
-from unittest.mock import patch
 
 import torch
 from einops import rearrange
@@ -104,71 +103,41 @@ class TestVisionFlashOpWrapper(CustomTestCase):
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
 
 
-class TestVisionFlashTiling(CustomTestCase):
-    """The vision op's JAX body, with the kernel swapped for the JAX reference:
-    shapes on the single KV step call it unchanged; tiled shapes are padded to
-    4,096, tiled, and sliced back to the per-segment attention of the real tokens."""
+class TestVisionFlashBlockSizes(CustomTestCase):
+    """``flash_block_sizes`` pads the sequence to the kernel's tile; the default
+    keeps 128-token padding."""
 
-    def _run(self, seq_lens, tiles, h=2, d=16):
-        import jax.numpy as jnp
-        import numpy as np
-
-        from sglang_tpu import attention_pallas
-        from sglang_tpu.kernels.flash_attention import mha_reference
-
-        calls = []
-
-        def reference(q, k, v, *, segment_ids, causal, sm_scale, block_sizes, **_):
-            calls.append((q.shape[2], block_sizes))
-            return mha_reference(
-                q, k, v, None, segment_ids=segment_ids, causal=causal, sm_scale=sm_scale
-            )
-
+    def _run(self, s, block_sizes, h=2, d=16):
         torch.manual_seed(0)
-        s, scale = sum(seq_lens), 1.0 / math.sqrt(d)
-        q, k, v = (torch.randn(1, h, s, d) for _ in range(3))
-        seg = torch.cat(
-            [torch.full((n,), i, dtype=torch.int32) for i, n in enumerate(seq_lens)]
-        ).unsqueeze(0)
-        with patch.object(
-            attention_pallas, "_vision_flash_tiles", lambda seq_len, heads: tiles
-        ):
-            out = attention_pallas._vision_flash(
-                *(jnp.asarray(x.numpy()) for x in (q, k, v, seg)),
-                sm_scale=scale,
-                attention=reference,
-            )
-        ref = _ref_segment_attention(q, k, v, seg, scale)
-        torch.testing.assert_close(
-            torch.from_numpy(np.asarray(out)), ref, atol=1e-4, rtol=1e-4
+        scale = 1.0 / math.sqrt(d)
+        q, k, v = (torch.randn(s, h, d) for _ in range(3))
+        seg = torch.zeros(1, s, dtype=torch.int32)
+        seg[0, s // 3 :] = 1
+        attn = _CpuVisionAttn(d, h, scale)
+        attn._flash_block_sizes = block_sizes
+        seen = []
+
+        def flash_op(q, k, v, seg_ids):
+            seen.append(tuple(seg_ids.shape))
+            return _ref_segment_attention(q, k, v, seg_ids, scale)
+
+        attn._flash_op = flash_op
+        out = attn.forward(q, k, v, bsz=1, segment_ids=seg.clone())
+        qr, kr, vr = (rearrange(x, "(b s) h d -> b h s d", b=1) for x in (q, k, v))
+        ref = rearrange(
+            _ref_segment_attention(qr, kr, vr, seg, scale), "b h s d -> (b s) h d"
         )
-        return calls
+        torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
+        return seen
 
-    def test_single_step_shape_calls_kernel_unchanged(self):
-        self.assertEqual(self._run([300, 212], tiles=False), [(512, None)])
+    def test_default_pads_to_128(self):
+        self.assertEqual(self._run(1100, None), [(1, 1152)])
 
-    def test_tiled_shape_is_padded_tiled_and_sliced(self):
-        from sglang_tpu.attention_pallas import _VISION_FLASH_TILED_BLOCKS
+    def test_explicit_blocks_pad_to_the_tile(self):
+        from sglang_tpu.kernels.flash_attention import BlockSizes
 
-        # 1,100 tokens -> padded to 4,096 for the tiled blocks.
-        calls = self._run([700, 400], tiles=True)
-        self.assertEqual(calls, [(4096, _VISION_FLASH_TILED_BLOCKS)])
-
-    def test_tiles_only_where_the_single_step_runs_out_of_vmem(self):
-        from sglang_tpu.attention_pallas import _vision_flash_tiles
-
-        for seq_len, heads, tiles in (
-            (12288, 16, False),
-            (15872, 8, False),
-            (16384, 1, False),
-            (20480, 1, False),
-            (16256, 2, True),
-            (16384, 8, True),
-            (24576, 1, True),
-        ):
-            self.assertEqual(
-                _vision_flash_tiles(seq_len, heads), tiles, (seq_len, heads)
-            )
+        blocks = BlockSizes(block_q=512, block_k_major=4096, block_k=1024, block_b=1)
+        self.assertEqual(self._run(1100, blocks), [(1, 4096)])
 
 
 if __name__ == "__main__":
