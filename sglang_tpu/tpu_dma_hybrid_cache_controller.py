@@ -56,6 +56,18 @@ def _check_kv_page_pool(name: PoolName) -> None:
         )
 
 
+class BatchGateCounter(BatchDoneCounter):
+    """BatchDoneCounter plus the per-layer ``wait_until`` that recurrent-state
+    accessors call once the counter is registered on the req-to-token pool."""
+
+    def wait_until(self, threshold: int) -> None:
+        # Inside a compiled forward the whole batch already waited before
+        # launch, and branching on the slot would guard the graph on it.
+        del threshold
+        if not torch.compiler.is_compiling():
+            self.wait()
+
+
 class TpuDMAHybridCacheController(HybridCacheController):
     """Hybrid (multi-pool) HiCache controller whose transfers go through a
     TPU DMA backend, one all-layer call per pool entry."""
@@ -72,7 +84,7 @@ class TpuDMAHybridCacheController(HybridCacheController):
         # re-register it on the device pool wrapper (SWAKVPool holds the
         # counter itself; its sub-pools carry None), so CompiledForwardShim's
         # whole-batch ``wait()`` resolves against the reload event.
-        self.layer_done_counter = BatchDoneCounter()
+        self.layer_done_counter = BatchGateCounter()
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
     # ----- draft registration guards -----------------------------------------

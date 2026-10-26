@@ -174,16 +174,6 @@ class BatchDoneCounter:
         if ev is not None:
             ev.synchronize()
 
-    def wait_until(self, threshold: int) -> None:
-        """Per-layer wait of LayerDoneCounter: the whole batch gates at once.
-
-        Inside a compiled forward this is a no-op: the forward already waited
-        before launch, and branching on the slot would guard the graph on it.
-        """
-        del threshold
-        if not torch.compiler.is_compiling():
-            self.wait()
-
     def reset(self) -> None:
         """Reset lifecycle: land pending commits, then clear every slot.
 

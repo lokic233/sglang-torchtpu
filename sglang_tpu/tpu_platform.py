@@ -1221,30 +1221,6 @@ class TpuSRTPlatform(SRTPlatform):
             return TpuFusedMHATokenToKVPoolHost
         return MHATokenToKVPoolHost
 
-    def get_mla_kv_pool_host_cls(self, device_pool) -> type:
-        from sglang.srt.runtime_context import get_memory
-        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
-        from sglang_tpu.kv_pool_host import tpu_dma_host_kv_pool_cls
-
-        io_backend = get_memory().hicache_io_backend
-        if is_tpu_dma_hicache_backend(io_backend) and isinstance(
-            device_pool, TpuSplitMLATokenToKVPool
-        ):
-            return tpu_dma_host_kv_pool_cls(io_backend)
-        return super().get_mla_kv_pool_host_cls(device_pool)
-
-    def get_mamba_pool_host_cls(self, device_pool) -> type:
-        from sglang.srt.runtime_context import get_memory
-        from sglang_tpu.kv_pool_host import tpu_dma_mamba_pool_host_cls
-        from sglang_tpu.mamba_pool import TpuMambaPool
-
-        io_backend = get_memory().hicache_io_backend
-        if is_tpu_dma_hicache_backend(io_backend) and isinstance(
-            device_pool, TpuMambaPool
-        ):
-            return tpu_dma_mamba_pool_host_cls(io_backend)
-        return super().get_mamba_pool_host_cls(device_pool)
-
     def get_mla_kv_pool_cls(self) -> type:
         # pallas_tpu_mla uses the paged fused latent layout the MLA v2 kernel
         # addresses; other backends (torch_native reference) keep the flat

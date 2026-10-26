@@ -522,33 +522,101 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             index_kpool=4,
         )
 
-    def test_host_pools_follow_the_device_pool_and_io_backend(self):
-        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
-        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-        from sglang_tpu.kv_pool_host import TpuDMAHostKVPool, TpuDMAMambaPoolHost
+    def test_strategy_takes_tpu_state_pools_under_a_dma_engine_only(self):
+        """The upstream mamba stack builds CUDA host pools that cannot read TPU's
+        per-layer states, so the TPU stack must win exactly when it can copy them."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang_tpu.hybrid_linear_hicache import TpuDmaMambaStrategy
         from sglang_tpu.mamba_pool import TpuMambaPool
-        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
-        platform = TpuSRTPlatform()
-        split = self._split_pool()
-        state = object.__new__(TpuMambaPool)
-        for io_backend, mla, mamba in (
-            ("raiden", TpuDMAHostKVPool, TpuDMAMambaPoolHost),
-            ("torch_tpu", MLATokenToKVPoolHost, MambaPoolHost),
-        ):
+        tpu_kvcache = object.__new__(HybridLinearKVPool)
+        tpu_kvcache.mamba_pool = object.__new__(TpuMambaPool)
+        gpu_kvcache = object.__new__(HybridLinearKVPool)
+        gpu_kvcache.mamba_pool = object()
+        both = {ComponentType.FULL, ComponentType.MAMBA}
+        cases = (
+            ("raiden", tpu_kvcache, both, True),
+            ("torch_tpu", tpu_kvcache, both, False),
+            ("raiden", gpu_kvcache, both, False),
+            ("raiden", tpu_kvcache, {ComponentType.FULL}, False),
+        )
+        for io_backend, kvcache, components, expected in cases:
             with (
-                self.subTest(io_backend=io_backend),
+                self.subTest(io_backend=io_backend, components=components),
                 patch(
-                    "sglang.srt.runtime_context.get_memory",
+                    "sglang_tpu.hybrid_linear_hicache.get_memory",
                     return_value=SimpleNamespace(hicache_io_backend=io_backend),
                 ),
             ):
-                self.assertIs(platform.get_mla_kv_pool_host_cls(split), mla)
-                self.assertIs(platform.get_mamba_pool_host_cls(state), mamba)
-                # A pool the engine cannot page keeps the in-tree host pool.
-                self.assertIs(
-                    platform.get_mla_kv_pool_host_cls(object()), MLATokenToKVPoolHost
+                self.assertEqual(
+                    TpuDmaMambaStrategy().matches(kvcache, components), expected
                 )
+
+    def test_strategy_builds_dma_host_pools_and_controller(self):
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang_tpu import hybrid_linear_hicache
+
+        kv_host, state_host = MagicMock(), MagicMock()
+        memory = SimpleNamespace(
+            hicache_io_backend="raiden",
+            hicache_size=0,
+            hicache_ratio=2,
+            hicache_mem_layout="page_first_fused",
+            hicache_write_policy="write_through",
+            hicache_host_memory_mode=None,
+        )
+        req_pool = SimpleNamespace(
+            mamba_pool=object(),
+            mamba_map={1: 0, 2: 1},
+            mamba_allocator=SimpleNamespace(alloc=MagicMock(), free=MagicMock()),
+        )
+        kvcache = SimpleNamespace(
+            full_kv_pool=object(),
+            full_attention_layer_id_mapping={0: 0, 3: 1},
+            start_layer=0,
+        )
+        params = SimpleNamespace(
+            mtp_draft_device_pools=(),
+            req_to_token_pool=req_pool,
+            page_size=128,
+            token_to_kv_pool_allocator=object(),
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        with (
+            patch.object(hybrid_linear_hicache, "get_memory", return_value=memory),
+            patch(
+                "sglang_tpu.kv_pool_host.tpu_dma_host_kv_pool_cls",
+                return_value=MagicMock(return_value=kv_host),
+            ),
+            patch(
+                "sglang_tpu.kv_pool_host.tpu_dma_mamba_pool_host_cls",
+                return_value=MagicMock(return_value=state_host),
+            ),
+            patch(
+                "sglang_tpu.tpu_dma_hybrid_cache_controller.TpuDMAHybridCacheController"
+            ) as controller,
+        ):
+            result = hybrid_linear_hicache.TpuDmaMambaStrategy().build(
+                cache=MagicMock(),
+                kvcache=kvcache,
+                params=params,
+                server_args=None,
+                load_cache_event=None,
+            )
+        self.assertIs(result.cache_controller, controller.return_value)
+        self.assertEqual(controller.call_args.kwargs["io_backend"], "raiden")
+        self.assertEqual(
+            result.component_host_pools,
+            {ComponentType.FULL: kv_host, ComponentType.MAMBA: state_host},
+        )
+        self.assertEqual(
+            set(result.host_pool_group.entry_map), {PoolName.KV, PoolName.MAMBA}
+        )
+        self.assertTrue(result.register_req_to_token_counter)
 
     def test_split_pool_host_sizing_matches_its_allocation(self):
         """A host page holds every DSA buffer of the page, so host bytes per token
@@ -595,11 +663,13 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
                         call()
 
 
-class TestBatchDoneCounterLayerWait(CustomTestCase):
+class TestBatchGateCounterLayerWait(CustomTestCase):
     def test_layer_wait_gates_eager_callers_only(self):
         """Recurrent-state pools wait per layer through wait_until; the batch
         counter must honor it eagerly and stay out of a compiled forward."""
-        counter = BatchDoneCounter()
+        from sglang_tpu.tpu_dma_hybrid_cache_controller import BatchGateCounter
+
+        counter = BatchGateCounter()
         event = MagicMock()
         counter.set_event(0, event)
         counter.set_consumer(0)
