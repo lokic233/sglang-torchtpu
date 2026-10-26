@@ -1,15 +1,12 @@
-"""SPMD-safe regional compile: the opt-in contract, the TPU wrapper and the
-rank-invariant inputs Wan feeds its blocks."""
+"""Regional-compile hooks: the SPMD-safe opt-in contract, the rank-invariant
+inputs Wan feeds its blocks, and the fusion barrier."""
 
 import contextlib
-import importlib.util
-import sys
 import unittest
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-import torch.compiler.config as compiler_config
 from torch import nn
 from torch.utils._pytree import tree_leaves
 
@@ -22,13 +19,11 @@ from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.models.dits import wanvideo
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms.interface import Platform
-from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     compile_matching_submodules,
 )
 
 _COMPILE = "sglang.multimodal_gen.runtime.utils.torch_compile"
-_CACHE_TAG = "spmd-safe-regions-v1"
 
 
 class _Region(nn.Module):
@@ -88,50 +83,35 @@ class TestSpmdSafeRegions(unittest.TestCase):
         self.assertFalse(BaseDiT._compile_regions_spmd_safe)
         self.assertTrue(wanvideo.WanTransformer3DModel._compile_regions_spmd_safe)
 
-    @staticmethod
-    def _torch_tpu_stubs(spmd_safe=None):
-        names = (
-            "torch_tpu",
-            "torch_tpu._internal",
-            "torch_tpu._internal.distributed",
-            "torch_tpu._internal.distributed.spmd_util",
+
+class TestFusionBarrier(unittest.TestCase):
+    def test_default_platform_returns_the_input(self):
+        x = torch.arange(4.0)
+        self.assertIs(Platform.fusion_barrier(x), x)
+
+    def test_wan_ffn_runs_the_barrier_between_the_activation_and_fc_out(self):
+        calls = []
+
+        def step(name, value):
+            calls.append(name)
+            return value
+
+        mlp = SimpleNamespace(
+            fc_in=lambda x: (step("fc_in", x), None),
+            fc_out=lambda x: (step("fc_out", x), None),
+            _apply_activation=lambda x, bias, use_fused_bias_gelu: step("act", x),
         )
-        stubs = {name: ModuleType(name) for name in names}
-        if spmd_safe is not None:
-            stubs[names[-1]].spmd_safe = spmd_safe
-        return stubs
-
-    def test_tpu_wrapper_tags_the_compile_cache_once(self):
-        spmd_safe = object()
-        stubs = self._torch_tpu_stubs(spmd_safe)
-        for user_tag, expected in (("", _CACHE_TAG), ("user", f"user|{_CACHE_TAG}")):
-            with (
-                self.subTest(user_tag=user_tag),
-                patch.dict(sys.modules, stubs),
-                compiler_config.patch(cache_key_tag=user_tag),
-            ):
-                for _ in range(2):
-                    self.assertIs(
-                        TpuPlatform().prepare_spmd_region_wrapper(), spmd_safe
-                    )
-                self.assertEqual(compiler_config.cache_key_tag, expected)
-
-    def test_torch_tpu_without_spmd_safe_leaves_regions_unwrapped(self):
-        # spmd_safe is a private torch_tpu API: without it, regions compile
-        # with split collectives and the cache key keeps its tags.
         with (
-            patch.dict(sys.modules, self._torch_tpu_stubs()),
-            compiler_config.patch(cache_key_tag="user"),
+            patch.object(wanvideo, "fused_gelu_active", return_value=False),
+            patch.object(wanvideo, "nvfp4_bias_gelu_active", return_value=False),
+            patch.object(
+                wanvideo.current_platform,
+                "fusion_barrier",
+                side_effect=lambda x: step("barrier", x),
+            ),
         ):
-            self.assertIsNone(TpuPlatform().prepare_spmd_region_wrapper())
-            self.assertEqual(compiler_config.cache_key_tag, "user")
-
-    @unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires torch_tpu")
-    def test_tpu_wrapper_is_torch_tpu_spmd_safe(self):
-        from torch_tpu._internal.distributed.spmd_util import spmd_safe
-
-        with compiler_config.patch(cache_key_tag=""):
-            self.assertIs(TpuPlatform().prepare_spmd_region_wrapper(), spmd_safe)
+            wanvideo._WanGELUMLP.forward(mlp, torch.ones(2))
+        self.assertEqual(calls, ["fc_in", "act", "barrier", "fc_out"])
 
 
 class _Stop(Exception):

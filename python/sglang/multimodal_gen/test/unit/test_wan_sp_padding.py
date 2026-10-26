@@ -192,7 +192,7 @@ class TestWanSequenceShardPadding(unittest.TestCase):
                 (call,) = self._self_attention_calls(
                     _PADDED,
                     rank,
-                    AttentionBackendEnum.TPU_SPLASH_ATTN,
+                    AttentionBackendEnum.OOT,
                     ulysses=2,
                     ring_resume=True,
                 )
@@ -205,7 +205,7 @@ class TestWanSequenceShardPadding(unittest.TestCase):
                 (call,) = self._self_attention_calls(
                     _PADDED,
                     rank,
-                    AttentionBackendEnum.TPU_SPLASH_ATTN,
+                    AttentionBackendEnum.OOT,
                     ulysses=2,
                     ring_resume=True,
                 )
@@ -214,7 +214,7 @@ class TestWanSequenceShardPadding(unittest.TestCase):
                 attn.skip_sequence_parallel = False
                 attn.sp_attention_mode = "ulysses"
                 attn.sp_attention_mode_is_auto = False
-                attn.backend = AttentionBackendEnum.TPU_SPLASH_ATTN
+                attn.backend = AttentionBackendEnum.OOT
                 attn.causal = False
                 attn.attn_impl = SimpleNamespace(supports_ring_resume=lambda: True)
                 q = torch.randn(1, 7, 2, 8)
