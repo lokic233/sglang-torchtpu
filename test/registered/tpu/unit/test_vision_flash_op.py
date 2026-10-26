@@ -81,7 +81,7 @@ class TestVisionFlashOpWrapper(CustomTestCase):
         return out, ref
 
     def test_single_segment_with_padding(self):
-        # 100 -> padded to 128; the 28 pad tokens form their own segment.
+        # 100 -> padded to _BLOCK_SIZE; the pad tokens form their own segment.
         out, ref = self._run([100])
         self.assertEqual(tuple(out.shape), tuple(ref.shape))
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
@@ -92,8 +92,8 @@ class TestVisionFlashOpWrapper(CustomTestCase):
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
 
     def test_exact_block_multiple_no_padding(self):
-        # 128 is a multiple of _BLOCK_SIZE -> no padding branch.
-        out, ref = self._run([128])
+        # A multiple of _BLOCK_SIZE -> no padding branch.
+        out, ref = self._run([VisionTpuAttention._BLOCK_SIZE])
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
 
     def test_pad_segment_does_not_leak(self):
@@ -104,19 +104,24 @@ class TestVisionFlashOpWrapper(CustomTestCase):
 
 
 class TestVisionFlashBlockSizes(CustomTestCase):
-    """The vision op's tiled block sizes are valid for every padded length."""
+    """Every length the op can see gets the fast tiled blocks."""
 
-    def test_blocks_divide_every_padded_length(self):
+    def test_padded_lengths_get_full_query_blocks(self):
         from sglang_tpu.attention_pallas import _vision_flash_block_sizes
 
-        for s in range(VisionTpuAttention._BLOCK_SIZE, 100_000, 128):
-            b = _vision_flash_block_sizes(s)
-            self.assertEqual(s % b.block_q, 0, s)
-            self.assertEqual(s % b.block_k_major, 0, s)
-            self.assertEqual(b.block_k_major % b.block_k, 0, s)
-            # Bounded blocks are what keep the kernel's VMEM use independent of s.
-            self.assertLessEqual(b.block_q, 512, s)
+        block = VisionTpuAttention._BLOCK_SIZE
+        for s in range(1, 100_001):
+            padded = s + (-s) % block
+            b = _vision_flash_block_sizes(padded)
+            self.assertEqual(b.block_q, 512, s)
+            self.assertGreaterEqual(b.block_k_major, 1024, s)
             self.assertLessEqual(b.block_k_major, 4096, s)
+
+    def test_rejects_unpadded_length(self):
+        from sglang_tpu.attention_pallas import _vision_flash_block_sizes
+
+        with self.assertRaises(ValueError):
+            _vision_flash_block_sizes(15872)
 
 
 if __name__ == "__main__":

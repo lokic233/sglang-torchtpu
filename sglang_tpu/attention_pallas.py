@@ -471,20 +471,24 @@ _VISION_FLASH_OPS: dict[float, object] = {}
 
 
 def _vision_flash_block_sizes(seq_len: int) -> BlockSizes:
-    """Flash block sizes for the vision op; ``seq_len`` is a multiple of 128.
+    """Flash block sizes for the vision op; ``seq_len`` must be a multiple of 1,024.
 
     The kernel's default runs one KV step over the whole sequence up to 92,800
     keys, so its VMEM use grows with the sequence: on TPU7x, 16,384 keys with 2+
     local heads exceed a 24 MiB scoped limit. Tiling the KV sequence bounds VMEM
-    by the block sizes instead, and with 512-row query blocks it is also faster
-    than the single step (10-15% on TPU7x, head_dim 96, 8k-24k keys). Each block
-    is the gcd with the sequence length, so it always divides it.
+    by the block sizes instead, but only large tiles keep it fast: 128-row query
+    blocks are 4-17x slower than the single step and 512-key KV blocks up to
+    1.7x slower. So ``VisionTpuAttention`` pads to a multiple of 1,024, and the KV
+    block is the largest of 1,024 / 2,048 / 4,096 that divides the sequence.
     """
-    block_k_major = math.gcd(seq_len, 4096)
+    if seq_len % 1024:
+        raise ValueError(
+            f"vision flash attention needs a multiple of 1,024 tokens, got {seq_len}"
+        )
     return BlockSizes(
-        block_q=math.gcd(seq_len, 512),
-        block_k_major=block_k_major,
-        block_k=math.gcd(block_k_major, 1024),
+        block_q=512,
+        block_k_major=math.gcd(seq_len, 4096),
+        block_k=1024,
         block_b=1,
     )
 
