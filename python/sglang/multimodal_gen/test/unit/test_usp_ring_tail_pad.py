@@ -70,7 +70,7 @@ class TestRingTailPadDispatch(unittest.TestCase):
 
     def test_tail_pad_meta_reaches_the_allgather_ring(self):
         obj = self._attn()
-        obj.backend = AttentionBackendEnum.TPU_SPLASH_ATTN
+        obj.backend = AttentionBackendEnum.OOT
         obj.attn_impl = SimpleNamespace(supports_ring_resume=lambda: True)
         q = torch.randn(1, 8, 2, 8)
         meta = {"pad_start": 13, "pad_end": 16, "local_pad": 3}

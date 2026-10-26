@@ -17,9 +17,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionBackend,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
-from sglang.multimodal_gen.runtime.server_args.server_args import (
-    TPU_RING_CAPABLE_ATTENTION_BACKENDS,
-)
+from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.test.unit.test_usp_allgather_ring import (  # noqa: F401
     TestAllGatherRingAttention,
 )
@@ -27,6 +25,7 @@ from sglang.multimodal_gen.test.unit.test_usp_ring_tail_pad import (  # noqa: F4
     TestRingTailPadDispatch,
 )
 from sglang_tpu.multimodal_gen import tpu_splash_attn
+from sglang_tpu.multimodal_gen.platform import TpuOOTPlatform
 from sglang_tpu.multimodal_gen.tpu_splash_attn import (
     TpuSplashAttentionBackend,
     TpuSplashAttentionImpl,
@@ -36,9 +35,10 @@ from sglang_tpu.multimodal_gen.tpu_splash_attn import (
 class TestTpuSplashRingCapability(unittest.TestCase):
     def test_declares_ring_support(self):
         self.assertTrue(TpuSplashAttentionBackend.supports_ring_rotation())
+        self.assertIs(TpuSplashAttentionBackend.get_enum(), AttentionBackendEnum.OOT)
         self.assertEqual(
-            TPU_RING_CAPABLE_ATTENTION_BACKENDS,
-            (TpuSplashAttentionBackend.get_enum().name.lower(),),
+            TpuOOTPlatform.get_ring_capable_attention_backends(),
+            (TpuOOTPlatform.get_oot_attn_backend_name(),),
         )
 
     def test_only_the_tpu_impl_resumes_in_kernel(self):
@@ -54,23 +54,25 @@ class TestTpuSplashRingCapability(unittest.TestCase):
         )
         from sglang.multimodal_gen.runtime.layers.attention import selector
         from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-        from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
         from sglang.multimodal_gen.runtime.server_args import server_args
         from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 
         with patch.object(PipelineConfig, "from_kwargs", return_value=PipelineConfig()):
             args = ServerArgs.from_dict({"model_path": "/fake"})
         args.num_gpus, args.ring_degree = 8, 2
-        platforms = "sglang.multimodal_gen.runtime.platforms"
-        with patch(f"{platforms}.current_platform.is_tpu", return_value=True):
+        args.attention_backend = None
+        with patch.object(server_args, "current_platform", TpuOOTPlatform()):
             args._adjust_attention_backend()
-        self.assertEqual(args.attention_backend, "tpu_splash_attn")
+        self.assertEqual(args.attention_backend, "oot")
         self.assertFalse(args.is_arg_explicitly_set("attention_backend"))
 
         selector._cached_get_attn_backend.cache_clear()
         try:
             with (
-                patch(f"{platforms}.current_platform", TpuPlatform()),
+                patch(
+                    "sglang.multimodal_gen.runtime.platforms.current_platform",
+                    TpuOOTPlatform(),
+                ),
                 patch.object(server_args, "_global_server_args", args),
             ):
                 backend = selector.get_attn_backend(

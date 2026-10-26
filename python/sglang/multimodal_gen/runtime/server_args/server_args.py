@@ -106,7 +106,6 @@ MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 # Mirrors AttentionBackend.supports_ring_rotation; the name-level check
 # runs before backend classes are importable on every platform.
 RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
-TPU_RING_CAPABLE_ATTENTION_BACKENDS = ("tpu_splash_attn",)
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -1160,13 +1159,17 @@ class ServerArgs(DisaggServerArgsMixin):
 
         if self.ring_degree > 1:
             ring_backends = (
-                TPU_RING_CAPABLE_ATTENTION_BACKENDS
-                if current_platform.is_tpu()
-                else RING_CAPABLE_ATTENTION_BACKENDS
+                current_platform.get_ring_capable_attention_backends()
+                or RING_CAPABLE_ATTENTION_BACKENDS
             )
+            # attention_backend is normalized above (a platform's own backend
+            # name becomes "oot"); compare and default in that form.
+            ring_backend_ids = [
+                self._normalize_attention_backend_name(name) for name in ring_backends
+            ]
             if (
                 self.attention_backend is not None
-                and self.attention_backend not in ring_backends
+                and self.attention_backend not in ring_backend_ids
             ):
                 raise ValueError(
                     "Ring Attention requires one of the ring-capable backends "
@@ -1174,11 +1177,11 @@ class ServerArgs(DisaggServerArgsMixin):
                     f"{self.attention_backend!r}"
                 )
             if self.attention_backend is None:
-                self.attention_backend = ring_backends[0]
+                self.attention_backend = ring_backend_ids[0]
                 logger.info(
                     "Ring Attention requires a ring-capable backend; "
                     "attention_backend has been automatically set to %s",
-                    self.attention_backend,
+                    ring_backends[0],
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
