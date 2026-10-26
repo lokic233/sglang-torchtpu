@@ -18,11 +18,11 @@ this module is adapted from (https://github.com/vllm-project/vllm-torchtpu/tree/
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import jax
 import torch
-from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel import (
     paged_attention,
 )
@@ -30,10 +30,10 @@ from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel impo
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang_tpu.kernels.flash_attention import (
+    BlockSizes,
     SegmentIds,
     flash_attention,
 )
-from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -468,13 +468,25 @@ class TpuPallasAttnBackend(AttentionBackend):
 # Vision encoder: non-causal flash attention with segment_ids
 # ---------------------------------------------------------------------------
 _VISION_FLASH_OPS: dict[float, object] = {}
-# Up to 92,800 keys the kernel runs one KV step over the whole sequence, so its
-# VMEM use grows with the key count: at 16,384 keys and 2+ local heads it needs
-# ~25 MiB on TPU7x, over a 24 MiB scoped limit. From there the op takes the full
-# VMEM, which a configured limit never exceeds; longer sequences need KV tiling
-# (block_k_major < kv_seq_len). Shorter calls keep the inherited limit, since
-# raising it there changed serving outputs (at bf16-noise level).
-_VISION_FLASH_FULL_VMEM_MIN_KEYS = 16384
+
+
+def _vision_flash_block_sizes(seq_len: int) -> BlockSizes:
+    """Flash block sizes for the vision op; ``seq_len`` is a multiple of 128.
+
+    The kernel's default runs one KV step over the whole sequence up to 92,800
+    keys, so its VMEM use grows with the sequence: on TPU7x, 16,384 keys with 2+
+    local heads exceed a 24 MiB scoped limit. Tiling the KV sequence bounds VMEM
+    by the block sizes instead, and with 512-row query blocks it is also faster
+    than the single step (10-15% on TPU7x, head_dim 96, 8k-24k keys). Each block
+    is the gcd with the sequence length, so it always divides it.
+    """
+    block_k_major = math.gcd(seq_len, 4096)
+    return BlockSizes(
+        block_q=math.gcd(seq_len, 512),
+        block_k_major=block_k_major,
+        block_k=math.gcd(block_k_major, 1024),
+        block_b=1,
+    )
 
 
 def _get_vision_flash_op(sm_scale: float):
@@ -487,12 +499,6 @@ def _get_vision_flash_op(sm_scale: float):
     from torch_tpu._internal import pallas
 
     def _jax_vision_flash(q, k, v, seg_ids):
-        vmem_limit_bytes = None
-        if k.shape[2] >= _VISION_FLASH_FULL_VMEM_MIN_KEYS:
-            # Distributed programs are traced on a CPU mesh, where get_tpu_info()
-            # raises; substitute the physical TPU metadata, as the GDN op does.
-            with tpu_info_for_cpu_export():
-                vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
         return flash_attention(
             q,
             k,
@@ -500,7 +506,8 @@ def _get_vision_flash_op(sm_scale: float):
             segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
             causal=False,
             sm_scale=sm_scale,
-            vmem_limit_bytes=vmem_limit_bytes,
+            block_sizes=_vision_flash_block_sizes(k.shape[2]),
+            vmem_limit_bytes=None,
         )
 
     _jax_vision_flash.__annotations__ = {

@@ -103,5 +103,21 @@ class TestVisionFlashOpWrapper(CustomTestCase):
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
 
 
+class TestVisionFlashBlockSizes(CustomTestCase):
+    """The vision op's tiled block sizes are valid for every padded length."""
+
+    def test_blocks_divide_every_padded_length(self):
+        from sglang_tpu.attention_pallas import _vision_flash_block_sizes
+
+        for s in range(VisionTpuAttention._BLOCK_SIZE, 100_000, 128):
+            b = _vision_flash_block_sizes(s)
+            self.assertEqual(s % b.block_q, 0, s)
+            self.assertEqual(s % b.block_k_major, 0, s)
+            self.assertEqual(b.block_k_major % b.block_k, 0, s)
+            # Bounded blocks are what keep the kernel's VMEM use independent of s.
+            self.assertLessEqual(b.block_q, 512, s)
+            self.assertLessEqual(b.block_k_major, 4096, s)
+
+
 if __name__ == "__main__":
     unittest.main()
