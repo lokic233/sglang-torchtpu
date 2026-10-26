@@ -1,4 +1,4 @@
-"""SDPA with query-broadcast masks on TPU matches CPU after the platform patch."""
+"""SDPA with query-broadcast masks on TPU matches CPU after the plugin's patch."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
@@ -10,9 +10,6 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.test.unit.test_tpu_platform import (  # noqa: F401
-    TestSdpaQueryBroadcastMask,
-)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -35,14 +32,18 @@ def _key_padding_mask():
     return keep
 
 
+def _init_worker():
+    from sglang_tpu.multimodal_gen.platform import TpuOOTPlatform
+
+    # Worker bring-up installs the plugin's runtime patches.
+    TpuOOTPlatform.set_device(TpuOOTPlatform.get_local_torch_device())
+
+
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuSdpaQueryBroadcastMask(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
-
-        # Worker bring-up installs the patch.
-        TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
+        _init_worker()
         assert getattr(F.scaled_dot_product_attention, "_sglang_tpu_mask_patch", False)
 
     def _check(self, mask):
@@ -73,13 +74,11 @@ class TestTpuSdpaQueryBroadcastMask(CustomTestCase):
 class TestTorchTpuStillNeedsTheMaskPatch(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
-
-        TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
+        _init_worker()
 
     def test_unpatched_sdpa_returns_nan(self):
         # Fails once torch_tpu handles query-broadcast masks; then remove
-        # _patch_sdpa_query_broadcast_mask and this test.
+        # sglang_tpu/multimodal_gen/sdpa_mask.py and this test.
         sdpa = getattr(
             F.scaled_dot_product_attention,
             "__wrapped__",
@@ -96,8 +95,7 @@ class TestTorchTpuStillNeedsTheMaskPatch(CustomTestCase):
             torch.isnan(got.float()).any().item(),
             "torch_tpu now handles query-broadcast SDPA masks at this shape: "
             "check the production shapes (LTX-2 text masks), then remove "
-            "_patch_sdpa_query_broadcast_mask in "
-            "python/sglang/multimodal_gen/runtime/platforms/tpu.py and this test.",
+            "sglang_tpu/multimodal_gen/sdpa_mask.py and this test.",
         )
 
 

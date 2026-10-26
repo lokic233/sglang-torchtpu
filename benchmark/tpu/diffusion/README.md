@@ -21,6 +21,9 @@ LTX-2 under sequence parallelism skips attention masks only when no stream is pa
 `(num_frames - 1) / 8 + 1` must divide by the SP degree (121 frames at SP 4 qualifies; 97 and 241 do not), and
 likewise the audio latent frames. A padded stream keeps the masked attention path.
 
+`bench_splash_attn.py` times the splash attention kernels against SDPA at one shape on one core
+(`PYTHONPATH=python:. python3 benchmark/tpu/diffusion/bench_splash_attn.py`).
+
 ## Example requests
 
 `/v1/images/generations` returns the image; `size`, `num_inference_steps` and `guidance_scale` set the request.

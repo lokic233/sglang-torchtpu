@@ -15,7 +15,7 @@ head_dim 128.
 
 Run on one TPU core from the repository root:
 
-    PYTHONPATH=python:. python3 benchmark/kernels/attention/bench_tpu_splash_attn.py
+    PYTHONPATH=python:. python3 benchmark/tpu/diffusion/bench_splash_attn.py
 """
 
 import argparse

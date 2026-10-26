@@ -14,7 +14,14 @@ from sglang.multimodal_gen.runtime.loader.weight_readers import (
     select_weight_reader,
 )
 from sglang.multimodal_gen.runtime.platforms.interface import Platform
-from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
+
+
+class _HostReadPlatform(Platform):
+    """A platform whose device safetensors cannot open tensors on."""
+
+    @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        return False
 
 
 class TestCapabilities:
@@ -78,8 +85,10 @@ class TestSafetensorsDevicePlacement:
         ("platform", "device", "opened", "moved"),
         [
             pytest.param(Platform, "cuda:0", ["cuda:0"], [], id="device"),
-            pytest.param(TpuPlatform, "tpu:0", ["cpu"], ["tpu:0"], id="host-then-move"),
-            pytest.param(TpuPlatform, "cpu", ["cpu"], [], id="host-target"),
+            pytest.param(
+                _HostReadPlatform, "cuda:0", ["cpu"], ["cuda:0"], id="host-then-move"
+            ),
+            pytest.param(_HostReadPlatform, "cpu", ["cpu"], [], id="host-target"),
         ],
     )
     def test_open_device(self, monkeypatch, tmp_path, platform, device, opened, moved):

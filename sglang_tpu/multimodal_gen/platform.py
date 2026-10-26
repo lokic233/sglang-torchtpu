@@ -51,6 +51,17 @@ class TpuOOTPlatform(TpuPlatform):
         return SPLASH_ATTN_BACKEND_NAME
 
     @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        # safetensors rejects 'tpu:N'.
+        return False
+
+    @classmethod
+    def prefers_head_slab_output_exchange(cls) -> bool:
+        # torch_tpu relayouts a sequence-major staging copy around the
+        # collective; dense head slabs keep (8, 128) tiles unpadded.
+        return True
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,

@@ -4,9 +4,10 @@
 
 def install_runtime_patches() -> None:
     """Patch a worker; call after ``torch_tpu`` is imported."""
-    from sglang_tpu.multimodal_gen import rope
+    from sglang_tpu.multimodal_gen import rope, sdpa_mask
 
     rope.install()
+    sdpa_mask.install()
 
 
 def configure_compile_cache() -> None:
