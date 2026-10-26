@@ -121,7 +121,8 @@ class TpuEnvs:
     SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(False)
     # Every N verify steps, TP ranks compare a digest of their committed tokens and
     # raise on mismatch: hash_uniforms replaces the accept broadcast. 0 disables.
-    SGLANG_TPU_SPEC_RANK_CHECK_INTERVAL = EnvInt(64)
+    # Steps, not seconds, so every rank joins the same all-gather; ~1 min at bs 1.
+    SGLANG_TPU_SPEC_RANK_CHECK_INTERVAL = EnvInt(8192)
     # TpuBlockSpecWorker's candidate acceptance by block verification (Sun et al.
     # 2024, Algorithm 2) instead of token-wise rejection; lossless either way.
     SGLANG_TPU_SPEC_BLOCK_VERIFICATION = EnvBool(False)
