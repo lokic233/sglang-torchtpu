@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_server_args, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import allocate_and_assign_decode_cache
 from sglang_tpu.dflash_utils_tpu import gather_dflash_candidate_window
@@ -25,7 +25,6 @@ class HostPaddedDraftInput(SpecInput):
     """
 
     SPEC_INPUT_TYPE: ClassVar[SpecInputType]
-    supports_logprobs: ClassVar[bool] = False
     # Per-request tensors a subclass relays; filter/merge slice them before FutureMap owns the rows.
     RELAYED_FIELDS: ClassVar[tuple[str, ...]] = ("bonus_tokens", "new_seq_lens")
 
@@ -99,7 +98,7 @@ class HostPaddedDraftInput(SpecInput):
     ) -> None:
         # Kept on host: TpuSpecVerifyInput.from_batch uploads it at the forward's
         # bucket, which DP attention only fixes after this point.
-        if not _verify_window_eligible(batch, supports_logprobs=self.supports_logprobs):
+        if not _verify_window_eligible(batch):
             self.tpu_verify_cache_candidates = None
             self.tpu_committed_lens = None
             self.tpu_req_pool_indices = None
@@ -183,9 +182,7 @@ class HostPaddedDraftInput(SpecInput):
             setattr(self, name, torch.cat([left, right]))
 
 
-def _verify_window_eligible(
-    batch: ScheduleBatch, *, supports_logprobs: bool = False
-) -> bool:
+def _verify_window_eligible(batch: ScheduleBatch) -> bool:
     # A verify commits at most one window, the single offset the plan enumerates.
     # grammar_retained_tokens can commit less, and the compact draft cache maps
     # its own window from host lengths.
@@ -193,7 +190,12 @@ def _verify_window_eligible(
         batch.enable_overlap
         and isinstance(batch.req_pool_indices_cpu, torch.Tensor)
         and get_spec().speculative_draft_window_size is None
-        and (not batch.return_logprob or supports_logprobs)
+        and (
+            not batch.return_logprob
+            # Use the worker's request capability even for draft inputs built
+            # directly by the PD handoff, before the worker has run a step.
+            or batch.spec_algorithm.create_worker(get_server_args()).supports_logprobs
+        )
         and not batch.has_grammar
         and all(req.lora_id is None for req in batch.reqs)
     )

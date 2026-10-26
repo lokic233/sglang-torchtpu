@@ -84,7 +84,6 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
-from sglang_tpu.compilation.warmup_queue import eager_warmup
 from sglang_tpu.experimental import register_host_batch_padder
 from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
@@ -318,7 +317,7 @@ class TpuSpecWorker(BaseSpecWorker):
             + [((pbs, 1), torch.float32) for pbs in bucket_sizes]
             + [((pbs, 2 * self.num_verify_rows), torch.int64) for pbs in bucket_sizes]
         )
-        with torch.no_grad(), eager_warmup() as materialize:
+        with torch.no_grad():
             for bs in live_sizes:
                 # _bucket_state pads the relayed live state to each bucket it can run.
                 for padded_bs in self._decode_buckets_for(bs):
@@ -330,17 +329,13 @@ class TpuSpecWorker(BaseSpecWorker):
                         padded_bs,
                     )
             for shape, dtype in h2d_shapes:
-                materialize(
-                    torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True)
-                )
+                torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True).cpu()
             for pbs in bucket_sizes:
                 # _bucket_state derives live_mask from the padded pool rows.
-                materialize(
-                    torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0
-                )
+                (torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0).cpu()
                 # Eager ops compile per input layout, so bump finalize_accept's output.
                 next_seq_lens = self._warmup_accept(pbs).next_seq_lens
-                materialize((next_seq_lens + self.num_verify_rows).to(torch.int32))
+                (next_seq_lens + self.num_verify_rows).to(torch.int32).cpu()
 
     def _warmup_accept(self, padded_bs: int) -> AcceptResult:
         """finalize_accept outputs at padded_bs, the inputs eager consumers see while serving."""
@@ -450,11 +445,7 @@ class TpuSpecWorker(BaseSpecWorker):
         """
 
     def make_verify_input(
-        self,
-        *,
-        batch: ScheduleBatch,
-        verify_tokens: torch.Tensor,
-        rows: VerifyRows,
+        self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
     ) -> SpecInput:
         """The algorithm's own TARGET_VERIFY spec_info for [pbs * (N + 1)] verify rows.
 
@@ -919,7 +910,7 @@ class TpuSpecWorker(BaseSpecWorker):
         # A multimodal wrapper's eager outer logits processor emits live rows,
         # which TpuSampler pads to the batch bucket (whatever the input modality).
         eager_logits = not self._compile_policy()._compiles_logits_processor()
-        with torch.no_grad(), eager_warmup() as materialize:
+        with torch.no_grad():
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
                 for variant in _SAMPLING_WARMUP_VARIANTS:
                     # A target that keeps extend outputs padded samples all cap rows,
@@ -944,40 +935,33 @@ class TpuSpecWorker(BaseSpecWorker):
                             torch.zeros((rows,), dtype=torch.int64, device=self.device),
                         )
                         # extend() broadcasts these tokens; the collective compiles per shape.
-                        materialize(self.sync_target_tokens(next_token_ids))
+                        self.sync_target_tokens(next_token_ids).cpu()
             if self._dp_attention:
                 # A DP rank without prompts syncs no rows.
-                materialize(
-                    self.sync_target_tokens(
-                        torch.zeros((0,), dtype=torch.int64, device=self.device)
-                    )
-                )
+                self.sync_target_tokens(
+                    torch.zeros((0,), dtype=torch.int64, device=self.device)
+                ).cpu()
             for bs in extend_sizes:
                 # The shim pads the device-resident extend bs fields (seq_lens,
                 # req_pool_indices int64; orig_seq_lens int32) to the cap.
                 for dtype in (torch.int64, torch.int32):
-                    materialize(
-                        torch.nn.functional.pad(
-                            torch.zeros((bs,), dtype=dtype).to(self.device),
-                            (0, cap - bs),
-                        )
-                    )
+                    torch.nn.functional.pad(
+                        torch.zeros((bs,), dtype=dtype).to(self.device), (0, cap - bs)
+                    ).cpu()
                 # ModelRunner.sample positions, then the block-draft extend trim; a
                 # target that keeps extend outputs padded samples at the cap rows.
-                materialize(torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1)
+                (torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1).cpu()
                 for rows in {self._pad_bs(bs), cap}:
-                    materialize(
-                        torch.zeros((rows,), dtype=torch.int64, device=self.device)[:bs]
-                    )
+                    torch.zeros((rows,), dtype=torch.int64, device=self.device)[
+                        :bs
+                    ].cpu()
                 if eager_logits and self._pad_bs(bs) != bs:
-                    materialize(
-                        torch.nn.functional.pad(
-                            torch.zeros((bs, vocab_size), dtype=torch.float32).to(
-                                self.device
-                            ),
-                            (0, 0, 0, self._pad_bs(bs) - bs),
-                        )
-                    )
+                    torch.nn.functional.pad(
+                        torch.zeros((bs, vocab_size), dtype=torch.float32).to(
+                            self.device
+                        ),
+                        (0, 0, 0, self._pad_bs(bs) - bs),
+                    ).cpu()
 
     def _warmup_extend_logits(
         self, cap: int, rows: int, vocab_size: int
