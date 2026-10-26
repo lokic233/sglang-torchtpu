@@ -26,7 +26,7 @@ from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.dp_attention import dp_gather_width, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -974,16 +974,24 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if pp_group is None or pp_group.is_first_rank:
             return {}
         hidden_size = self.model_runner.model_config.hidden_size
-        zeros = functools.partial(
-            torch.zeros,
-            dtype=self.model_runner.dtype,
-            device=self.model_runner.device,
-        )
+        # Serving trims the wave's max-bucket buffers to the batch's bucket
+        # (_fit_pp_proxy_rows), so the program takes row views of them; warm
+        # with the same views, or each bucket copies its view on first use.
+        rows = self.max_padded_tokens()
+
+        def zeros(shape: tuple[int, int]) -> torch.Tensor:
+            buffer = torch.zeros(
+                (rows, shape[1]),
+                dtype=self.model_runner.dtype,
+                device=self.model_runner.device,
+            )
+            return buffer[: shape[0]]
+
         proxy = {
             "hidden_states": zeros((num_tokens, hidden_size)),
             "residual": zeros((num_tokens, hidden_size)),
         }
-        # Serving hands the Eagle3 capture slots on with the activations, so
+        # Serving hands the aux capture slots on with the activations, so
         # trace them too or the graph signature differs from the real one.
         num_aux = num_relayed_aux_slots(
             self.model_runner.spec_aux_config, self.model_runner.model
@@ -1681,7 +1689,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # so precompile traces the same DP graph serving uses. Without it,
         # precompile traces a different graph.
         if is_dp_attention_enabled():
-            self._set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
+            self.set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
         model.prepare_forward_batch(forward_batch)
         forward_batch.logits_output_mode = logits_output_mode
 
@@ -1745,7 +1753,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def warmup_eager_logits(self, cases: Sequence[EagerLogitsCase]) -> None:
         """Warm the logits a wrapper runs eagerly after its compiled decoder, one run per case."""
 
-    def _set_dp_attention_metadata(
+    def set_dp_attention_metadata(
         self, forward_batch: ForwardBatch, num_tokens: int, bs: int, mode: ForwardMode
     ) -> None:
         """Set the DP metadata in the same way as serving.
@@ -1787,6 +1795,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _dummy_mm_inputs(self, bs: int) -> Any:
         """``mm_inputs`` field for the dummy batch (``None`` for plain decoders)."""
         return None
+
+    def live_cache_loc_dtype(self) -> torch.dtype:
+        """Dtype of the extend cache locations the live allocator hands out."""
+        return self._dummy_out_cache_loc_dtype(ForwardMode.EXTEND)
 
     def _dummy_out_cache_loc_dtype(self, mode: ForwardMode) -> torch.dtype:
         """Match cache-location indices produced by the live allocator."""
@@ -1888,6 +1900,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             spec_algorithm=getattr(self.model_runner, "spec_algorithm", None),
             mm_inputs=self._dummy_mm_inputs(bs),
         )
+        self._add_dummy_mamba_tracking(batch, bs=bs, mode=mode)
         if enable_num_token_non_padded():
             # Serving sets these in init_new and ModelRunner.forward; the MoE
             # path guards on the field being present, so warmup must carry it.
@@ -1907,6 +1920,28 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 ),
             )
         return batch
+
+    def _add_dummy_mamba_tracking(
+        self, batch: ForwardBatch, *, bs: int, mode: ForwardMode
+    ) -> None:
+        """Give warmup batches the radix tracking plan serving extend/decode carry.
+
+        Their upload and the GDN backend's tracking metadata are eager ops keyed on
+        the bucket; an all-False mask writes no snapshot.
+        """
+        if (
+            self.model_runner.is_draft_worker
+            or not isinstance(self.model_runner.req_to_token_pool, HybridReqToTokenPool)
+            or not (mode.is_extend() or mode.is_decode())
+            or mode.is_target_verify()
+            or not get_exec().mamba.enable_mamba_extra_buffer
+        ):
+            return
+        # The scheduler builds these on the host, as int64 / bool.
+        batch.mamba_track_indices = torch.zeros(bs, dtype=torch.int64)
+        batch.mamba_track_mask = torch.zeros(bs, dtype=torch.bool)
+        if mode.is_extend():
+            batch.mamba_track_seqlens = torch.zeros(bs, dtype=torch.int64)
 
     def _make_top_k_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
         """Mirror an eligible serving batch for the common static TopK width.
@@ -1990,7 +2025,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
 
 class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
-    """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
+    """Qwen3-VL decoder policy that warms multimodal prefill call shapes.
+
+    ``spmd_safe`` declares the traced graphs identical across TP/EP ranks so
+    ``--use-spmd-compile`` can compile each warmup once and broadcast it. It
+    was verified with ``VERIFY_SPMD_SAFE=1`` for the Qwen3-VL-30B-A3B single
+    host and P/D recipes (#1623). Other models that reuse this policy must
+    pass the same verification before their recipes enable the flag: a
+    rank-dependent constant would ship the owner rank's executable to every
+    rank with no error.
+    """
+
+    spmd_safe = True
 
     def _warmup_host_padding(self) -> None:
         # The compiled inner decoder excludes eager prompt embedding and logits.

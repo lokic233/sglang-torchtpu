@@ -28,6 +28,7 @@ from sglang_tpu.experimental.speculative.block_draft_worker import (
     DraftSampler,
     SampledDrafts,
     TpuBlockDraftWorker,
+    target_input_embedding,
 )
 
 
@@ -101,7 +102,9 @@ def _attach_target_vocab(
     draft_model.logits_mup_width_multiplier = target_hf_text_config.to_dict().get(
         "logits_mup_width_multiplier"
     )
-    draft_model.attach_shared_modules(
-        embed_tokens=unwrap_lora_layer(target_model.get_input_embeddings()),
-        lm_head=unwrap_lora_layer(target_model.lm_head),
-    )
+    lm_head = unwrap_lora_layer(target_model.lm_head)
+    embedding = target_input_embedding(target_model)
+    if embedding is None:
+        draft_model.lm_head = lm_head
+        return
+    draft_model.attach_shared_modules(embed_tokens=embedding, lm_head=lm_head)
