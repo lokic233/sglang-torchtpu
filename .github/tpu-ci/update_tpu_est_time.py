@@ -12,7 +12,7 @@ Samples come from successful jobs of recent scheduled runs on main:
   - multi-host live-server segments: one "== live-server test: <file> ==" marker
     to the next (or the last pod line), server bring-up excluded.
 
-New estimate = p90 x MARGIN, rounded up to the minute, applied only when it
+New estimate = p90 x MARGIN, rounded up to 10s, applied only when it
 moves by at least MIN_DELTA_S and MIN_DELTA_REL. A literal timeout_per_file
 moves with it only where it equals est_time today; anything else is a
 deliberate figure (e.g. the bench matrix's budget chain) and is left alone.
@@ -35,11 +35,13 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "sgl-project/sglang-torchtpu")
+# file[:event]; schedule samples main only, pull_request samples the PR gate's branches.
 WORKFLOWS = (
-    "nightly-test-tpu.yml",
-    "feature-validation-tpu.yml",
-    "accuracy-test-tpu.yml",
-    "perf-test-tpu.yml",
+    "nightly-test-tpu.yml:schedule",
+    "feature-validation-tpu.yml:schedule",
+    "accuracy-test-tpu.yml:schedule",
+    "perf-test-tpu.yml:schedule",
+    "pr-test-tpu.yml:pull_request",
 )
 MARGIN = 1.25
 MIN_SAMPLES = 3
@@ -114,7 +116,7 @@ def propose(old: int, samples: List[int]) -> Optional[int]:
     """New est_time, or None when the data is thin or the move is noise."""
     if len(samples) < MIN_SAMPLES:
         return None
-    new = max(60, math.ceil(p90(samples) * MARGIN / 60) * 60)
+    new = max(10, math.ceil(p90(samples) * MARGIN / 10) * 10)
     if abs(new - old) < max(MIN_DELTA_S, MIN_DELTA_REL * old):
         return None
     return new
@@ -189,9 +191,12 @@ def collect(
 ) -> Dict[str, List[int]]:
     api = f"https://api.github.com/repos/{REPO}/actions"
     samples: Dict[str, List[int]] = defaultdict(list)
-    for wf in workflows:
+    for spec in workflows:
+        wf, _, event = spec.partition(":")
+        event = event or "schedule"
+        branch = "&branch=main" if event == "schedule" else ""
         runs = _get(
-            f"{api}/workflows/{wf}/runs?branch=main&event=schedule"
+            f"{api}/workflows/{wf}/runs?event={event}{branch}"
             f"&status=completed&per_page={runs_per_workflow}",
             token,
         ).get("workflow_runs", [])
@@ -214,7 +219,7 @@ def collect(
                 if len(jobs) < 100:
                     break
                 page += 1
-        print(f"{wf}: {len(runs)} runs scanned", file=sys.stderr)
+        print(f"{spec}: {len(runs)} runs scanned", file=sys.stderr)
     return samples
 
 
@@ -237,7 +242,9 @@ def plan(
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--runs", type=int, default=15, help="recent runs per workflow")
-    ap.add_argument("--workflows", nargs="+", default=WORKFLOWS, help="workflow files")
+    ap.add_argument(
+        "--workflows", nargs="+", default=WORKFLOWS, help="workflow file[:event]"
+    )
     ap.add_argument("--root", default=".", help="repo root to rewrite")
     ap.add_argument("--only", nargs="*", default=(), help="limit to these paths")
     ap.add_argument("--dry-run", action="store_true")

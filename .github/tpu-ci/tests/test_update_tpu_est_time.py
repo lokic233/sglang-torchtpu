@@ -46,7 +46,10 @@ class TestUpdateTpuEstTime(unittest.TestCase):
     def test_propose_needs_samples_and_a_real_move(self):
         self.assertIsNone(u.propose(10800, [5000, 5400]))  # too few samples
         self.assertIsNone(u.propose(6780, [5400, 5300, 5420]))  # within 10%
-        self.assertEqual(u.propose(10800, [4800, 5400, 6120]), 7680)
+        self.assertEqual(u.propose(10800, [4800, 5400, 6120]), 7650)
+        self.assertEqual(
+            u.propose(25, [60, 70, 80]), 100
+        )  # 10s rounding, not whole minutes
 
     def test_rewrite_moves_mirrored_timeout_per_file(self):
         out = u.rewrite(_SRC, 10800)
