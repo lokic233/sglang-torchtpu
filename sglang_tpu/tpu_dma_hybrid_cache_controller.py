@@ -40,14 +40,17 @@ from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, CombinedFutureEvent, Transfer
 logger = logging.getLogger(__name__)
 
 # Pools indexed by KV allocator pages, which the KV free fence keeps from loads
-# while a forward may still write them; any other pool's slots are unfenced.
+# while a forward may still write them.
 _KV_PAGE_POOLS = frozenset(
     (PoolName.KV, PoolName.SWA, PoolName.DRAFT, PoolName.DRAFT_SWA)
 )
+# Recurrent-state slots: the fence does not hold freed slots, so a load into one
+# waits for the in-flight forwards instead (see start_loading).
+_STATE_SLOT_POOLS = frozenset((PoolName.MAMBA,))
 
 
 def _check_kv_page_pool(name: PoolName) -> None:
-    if name not in _KV_PAGE_POOLS:
+    if name not in _KV_PAGE_POOLS | _STATE_SLOT_POOLS:
         raise NotImplementedError(
             f"The TPU hybrid HiCache path does not offload the {name.value} pool."
         )
@@ -225,6 +228,12 @@ class TpuDMAHybridCacheController(HybridCacheController):
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         self.load_queue.clear()
+        # A request that finished one step ago may still be writing its freed
+        # state slot in the in-flight forward, and that slot can be this load's target.
+        if self.kv_free_fence is not None and any(
+            t.name in _STATE_SLOT_POOLS for t in op.pool_transfers or ()
+        ):
+            self.kv_free_fence.wait_for_in_flight()
 
         # All pools' H2d; each future-event comes back before its DMA lands.
         # The consuming forward's CompiledForwardShim wait() polls the combined

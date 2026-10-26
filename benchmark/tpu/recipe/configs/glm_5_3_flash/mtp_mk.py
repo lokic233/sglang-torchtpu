@@ -8,6 +8,7 @@ verify, one tpu7x host (tp8).
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.glm_5_3_flash.mtp import CONFIG as MTP_CONFIG
+from benchmark.tpu.recipe.configs.glm_5_3_flash.server import HICACHE_ARGS
 from benchmark.tpu.recipe.configs.glm_5_3_flash.server_mk import CONFIG as MK_CONFIG
 
 CONFIG = deepcopy(MTP_CONFIG)
@@ -22,4 +23,6 @@ CONFIG["server_args"].update(
 CONFIG["runtime_env"].update(
     {k: v for k, v in MK_CONFIG["runtime_env"].items() if "GLM_FLASH_MEGAKERNEL" in k}
 )
+for _key in HICACHE_ARGS:
+    CONFIG["server_args"].pop(_key)
 CONFIG["runtime_env"]["SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING"] = "1"

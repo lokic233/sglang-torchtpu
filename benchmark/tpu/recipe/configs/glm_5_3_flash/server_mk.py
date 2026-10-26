@@ -7,9 +7,12 @@
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.glm_5_3_flash.server import CONFIG as BASE_CONFIG
+from benchmark.tpu.recipe.configs.glm_5_3_flash.server import HICACHE_ARGS
 
 CONFIG = deepcopy(BASE_CONFIG)
 CONFIG["server_args"]["max_running_requests"] = 1
 CONFIG["server_args"]["max_mamba_cache_size"] = 3
 CONFIG["server_args"]["disable_radix_cache"] = True
+for _key in HICACHE_ARGS:
+    CONFIG["server_args"].pop(_key)
 CONFIG["runtime_env"]["SGLANG_TPU_GLM_FLASH_MEGAKERNEL"] = "1"

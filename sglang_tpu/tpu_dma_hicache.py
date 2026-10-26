@@ -34,9 +34,9 @@ class TpuDMAKVTransfer(Protocol):
     """Copies whole pages between one device KV sub-pool and host memory.
 
     The registered factory builds it as ``factory(device_pool, num_host_pages)``,
-    once per device sub-pool (full, SWA, draft), after warm-up, on the thread that
-    issues torch ops on the pool. It may bind the pool's per-layer
-    ``get_fused_kv_buffer`` tensors once, so they must only be written in place.
+    once per device sub-pool (full, SWA, draft, recurrent state), after warm-up, on
+    the thread that issues torch ops on the pool. It may bind the pool's
+    ``page_major_tensors`` once, so they must only be written in place.
     It owns the host memory for ``num_host_pages`` pages (allocation, pinning, DMA
     registration); ``TpuDMAHostKVPool`` owns which pages are free.
     """
@@ -55,6 +55,26 @@ class TpuDMAKVTransfer(Protocol):
         Returns without waiting; the caller keeps the forward pass off the pages
         until the event is done.
         """
+
+
+def page_major_tensors(device_pool) -> list:
+    """The device tensors a page of ``device_pool`` spans, each indexed by page on dim 0.
+
+    A fused pool has one buffer per layer, the split sparse-MLA pool several per
+    layer, and a recurrent-state pool one tensor per layer and state kind, whose
+    "pages" are state slots.
+    """
+    from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
+    from sglang_tpu.mamba_pool import TpuMambaPool
+
+    if isinstance(device_pool, TpuMambaPool):
+        return device_pool.get_state()
+    layers = range(
+        device_pool.start_layer, device_pool.start_layer + device_pool.layer_num
+    )
+    if isinstance(device_pool, TpuSplitMLATokenToKVPool):
+        return [buf for layer in layers for buf in device_pool.get_page_buffers(layer)]
+    return [device_pool.get_fused_kv_buffer(layer) for layer in layers]
 
 
 def register_tpu_dma_hicache_backend(

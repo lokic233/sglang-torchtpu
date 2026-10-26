@@ -503,6 +503,113 @@ class TestAssemblerPlatformHook(CustomTestCase):
         self.assertEqual(built["kwargs"]["pool_label"], "swa")
 
 
+class TestSplitDsaAndStateOffload(CustomTestCase):
+    @staticmethod
+    def _split_pool():
+        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
+
+        return TpuSplitMLATokenToKVPool(
+            size=64,
+            page_size=32,
+            dtype=torch.float8_e4m3fn,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+            index_head_dim=128,
+            index_key_layers=[True, False, True],
+            index_kpool=4,
+        )
+
+    def test_host_pools_follow_the_device_pool_and_io_backend(self):
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+        from sglang_tpu.kv_pool_host import TpuDMAHostKVPool, TpuDMAMambaPoolHost
+        from sglang_tpu.mamba_pool import TpuMambaPool
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        platform = TpuSRTPlatform()
+        split = self._split_pool()
+        state = object.__new__(TpuMambaPool)
+        for io_backend, mla, mamba in (
+            ("raiden", TpuDMAHostKVPool, TpuDMAMambaPoolHost),
+            ("torch_tpu", MLATokenToKVPoolHost, MambaPoolHost),
+        ):
+            with (
+                self.subTest(io_backend=io_backend),
+                patch(
+                    "sglang.srt.runtime_context.get_memory",
+                    return_value=SimpleNamespace(hicache_io_backend=io_backend),
+                ),
+            ):
+                self.assertIs(platform.get_mla_kv_pool_host_cls(split), mla)
+                self.assertIs(platform.get_mamba_pool_host_cls(state), mamba)
+                # A pool the engine cannot page keeps the in-tree host pool.
+                self.assertIs(
+                    platform.get_mla_kv_pool_host_cls(object()), MLATokenToKVPoolHost
+                )
+
+    def test_split_pool_host_sizing_matches_its_allocation(self):
+        """A host page holds every DSA buffer of the page, so host bytes per token
+        must equal what the device pool allocates per token."""
+        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
+        from sglang_tpu.kv_pool_host import TpuDMAHostKVPool
+        from sglang_tpu.tpu_dma_hicache import page_major_tensors
+
+        split = self._split_pool()
+        tensors = page_major_tensors(split)
+        # NoPE + RoPE on every layer; index keys + raw key|gate on two.
+        self.assertEqual(len(tensors), 3 * 2 + 2 * 2)
+        self.assertEqual({t.shape[0] for t in tensors}, {split.num_pages})
+        host = object.__new__(TpuDMAHostKVPool)
+        host.device_pool, host.page_size = split, split.page_size
+        self.assertEqual(
+            host.get_size_per_token(),
+            TpuSplitMLATokenToKVPool.bytes_per_token(
+                index_head_dim=128, index_key_layers=[True, False, True], index_kpool=4
+            ),
+        )
+
+    def test_mla_offload_needs_a_dma_engine_and_the_split_pool_backend(self):
+        from sglang_tpu import tpu_platform
+
+        cases = (
+            ("raiden", "pallas_tpu_mla_sparse", (), None),
+            ("torch_tpu", "pallas_tpu_mla_sparse", (), "MLA model"),
+            ("raiden", "pallas_tpu_mla", (), "MLA model"),
+            ("raiden", "pallas_tpu_mla_sparse", ("pallas_tpu_mla",), "MLA model"),
+        )
+        for io_backend, backend, others, error in cases:
+            with self.subTest(io_backend=io_backend, backend=backend, others=others):
+                call = lambda: tpu_platform.validate_kv_offload_pools(
+                    io_backend=io_backend,
+                    attention_backend=backend,
+                    attention_backends=others,
+                    use_mla=True,
+                )
+                if error is None:
+                    call()
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
+                        call()
+
+
+class TestBatchDoneCounterLayerWait(CustomTestCase):
+    def test_layer_wait_gates_eager_callers_only(self):
+        """Recurrent-state pools wait per layer through wait_until; the batch
+        counter must honor it eagerly and stay out of a compiled forward."""
+        counter = BatchDoneCounter()
+        event = MagicMock()
+        counter.set_event(0, event)
+        counter.set_consumer(0)
+        counter.wait_until(3)
+        event.synchronize.assert_called_once()
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            counter.wait_until(3)
+        event.synchronize.assert_called_once()
+
+
 class TestDraftSidecar(CustomTestCase):
     def _controller_with_draft(self):
         ctrl = _make_controller()
@@ -581,21 +688,36 @@ class TestDraftCounterRegistration(CustomTestCase):
 
 
 class TestKVFreeFenceCoverage(CustomTestCase):
-    def test_pool_not_indexed_by_kv_pages_is_rejected(self):
-        """A load into a Mamba state slot bypasses the KV free fence, so a
-        forward still writing the freed slot could overwrite the loaded state."""
-        mamba = _FakeEntry(PoolName.MAMBA, _FakeHostPool(), device_pool=MagicMock())
-        with self.assertRaises(NotImplementedError):
-            _make_controller().register_host_pool_entry(mamba)
+    def test_state_slot_load_waits_for_in_flight_forwards(self):
+        """A freed Mamba state slot is not held by the KV free fence, so a load
+        into one must wait until no in-flight forward can still write it."""
+        ctrl = _make_controller()
+        mamba = _FakeEntry(PoolName.MAMBA, _FakeHostPool(page_size=1), object())
+        ctrl.mem_pool_host.entries.append(mamba)
+        ctrl.mem_pool_host.entry_map[PoolName.MAMBA] = mamba
+        ctrl.kv_free_fence = MagicMock()
 
-        def init_base(controller, *args, **kwargs):
-            controller.mem_pool_host = _FakeGroup(
-                _FakeEntry(PoolName.KV, _FakeHostPool(), MagicMock()), [mamba]
+        ctrl.load_queue.append(_op())
+        ctrl.start_loading()
+        ctrl.kv_free_fence.wait_for_in_flight.assert_not_called()
+
+        op = _op()
+        op.pool_transfers.append(
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                host_indices=torch.tensor([3]),
+                device_indices=torch.tensor([5]),
             )
+        )
+        ctrl.load_queue.append(op)
+        ctrl.start_loading()
+        ctrl.kv_free_fence.wait_for_in_flight.assert_called_once()
+        self.assertEqual(len(mamba.host_pool.loads), 1)
 
-        with patch.object(HybridCacheController, "__init__", init_base):
-            with self.assertRaises(NotImplementedError):
-                TpuDMAHybridCacheController()
+    def test_pool_outside_the_offload_set_is_rejected(self):
+        indexer = _FakeEntry(PoolName.INDEXER, _FakeHostPool(), MagicMock())
+        with self.assertRaises(NotImplementedError):
+            _make_controller().register_host_pool_entry(indexer)
 
     def test_load_inside_forward_write_target_is_rejected(self):
         """A raiden load inside forward_write_target() could be given a page an

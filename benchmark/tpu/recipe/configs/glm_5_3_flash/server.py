@@ -22,6 +22,15 @@ CONTEXT_LENGTH = (
 )
 MAX_RUNNING = CONCURRENCY if CONCURRENCY == 1 else CONCURRENCY + 2
 COMPILE_BS = [b for b in (1, 2, 4, 8, 16) if b <= CONCURRENCY] or [1]
+# Host tier for evicted prefixes (DSA pages and KDA state slots); a recipe
+# without the radix cache drops these keys.
+HICACHE_ARGS = {
+    "enable_hierarchical_cache": True,
+    "hicache_io_backend": "raiden",
+    "hicache_mem_layout": "page_first_fused",
+    "hicache_write_policy": "write_through",
+    "hicache_ratio": 2,
+}
 # Radix snapshot slots; too few stops cache hits silently. Arbitrary.
 MAMBA_SLOTS = 5 * MAX_RUNNING + 64
 
@@ -64,6 +73,7 @@ if DENSE_MAX_CONTEXT:
     CONFIG["server_args"]["json_model_override_args"] = json.dumps(
         {"index_topk": None, "text_config": {"index_topk": None}}
     )
+CONFIG["server_args"].update(HICACHE_ARGS)
 CONFIG["runtime_env"].update(
     {
         "SGLANG_MAMBA_SSM_DTYPE": "float32",

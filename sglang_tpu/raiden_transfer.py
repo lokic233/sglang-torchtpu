@@ -19,7 +19,7 @@ import time
 from typing import TYPE_CHECKING, List
 
 from sglang.srt.environ import envs
-from sglang_tpu.tpu_dma_hicache import NOOP_EVENT
+from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, page_major_tensors
 
 if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -93,8 +93,8 @@ class RaidenFutureEvent:
 
 
 class RaidenKVTransfer:
-    """Owns a raiden ``KVCacheManager`` over a TPU fused KV pool and issues
-    page-granular D2H / H2D transfers.
+    """Owns a raiden ``KVCacheManager`` over a TPU pool's page-major tensors and
+    issues page-granular D2H / H2D transfers.
 
     The device buffers are registered with raiden by raw PJRT pointer; the
     tensor list MUST stay alive for raiden's lifetime or ``D2h``/``H2d`` will
@@ -110,14 +110,12 @@ class RaidenKVTransfer:
 
         self.device_pool = device_pool
         self.num_host_pages = num_host_pages
-        self.layer_num = device_pool.layer_num
+        tensors = page_major_tensors(device_pool)
+        self.layer_num = len(tensors)
 
-        # outer list = layer, inner list = shard (one shard per TPU core here).
-        # Keep-alive: held on self so the underlying buffers outlive raiden.
-        self._device_tensors = [
-            [device_pool.get_fused_kv_buffer(device_pool.start_layer + i)]
-            for i in range(self.layer_num)
-        ]
+        # outer list = raiden "layer" (one per tensor), inner list = shard (one
+        # per TPU core here). Keep-alive: the buffers must outlive raiden.
+        self._device_tensors = [[t] for t in tensors]
         # raiden issues ``d2h`` / ``h2d`` copies on a background thread only
         # when this variable is set; otherwise the calls block the scheduler
         # thread until every per-layer copy has been submitted. The manager
@@ -131,10 +129,10 @@ class RaidenKVTransfer:
             unsafe_skip_buffer_lock=True,
         )
         logger.info(
-            "Raiden KV transfer ready: %d layers, %d host pages (page=%d tokens)",
+            "Raiden KV transfer ready: %d tensors, %d host pages, %.2f MiB per page",
             self.layer_num,
             num_host_pages,
-            device_pool.page_size,
+            sum(t.nbytes // t.shape[0] for t in tensors) / 2**20,
         )
 
     def backup(
