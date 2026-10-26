@@ -7,9 +7,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional
 
 import torch
+from torch import nn
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang_tpu.pp_wave import PPWave, build_pp_wave
+from sglang_tpu.pp_wave import PPWave, build_pp_wave, num_relayed_aux_slots
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -22,25 +23,62 @@ class PPDecodeTransferStatus(NamedTuple):
     failed_rids: List[str]
 
 
+def _check_aux_capture_relay(model: nn.Module) -> None:
+    """Raise when Eagle3 or DFlash/DSpark capture layers sit before the last
+    stage of a model whose forward does not relay them through PPProxyTensors."""
+    if getattr(model, "relays_pp_aux_hidden_states", False):
+        return
+    layer_model = model.model
+    missing = [
+        layer_id
+        for layer_id in layer_model.layers_to_capture
+        if not layer_model.start_layer <= layer_id < layer_model.end_layer
+    ]
+    if missing:
+        raise NotImplementedError(
+            f"Aux hidden state capture layers {missing} are not on the last "
+            f"pipeline stage (layers {layer_model.start_layer}.."
+            f"{layer_model.end_layer - 1}), and {type(model).__name__} does not "
+            "relay aux hidden states across stages. Pick draft capture layers "
+            "inside the last stage, or run without pipeline parallelism."
+        )
+
+
 def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
     """The stage's hand-off wave, sized to the largest batch a compiled
     forward can hand on."""
     from sglang_tpu.compilation.decoder_compile_policy import (
         DecoderTpuCompilePolicy,
     )
+    from sglang_tpu.compilation.recompilation_checker import (
+        snapshot_recompilation_baseline,
+    )
 
     model_runner = scheduler.tp_worker.model_runner
     policy = model_runner.compile_policy
     assert isinstance(policy, DecoderTpuCompilePolicy), type(policy)
-    return build_pp_wave(
+    aux_config = model_runner.spec_aux_config
+    if aux_config.eagle_use_aux_hidden_state or aux_config.dflash_use_aux_hidden_state:
+        _check_aux_capture_relay(model_runner.model)
+    num_aux = num_relayed_aux_slots(aux_config, model_runner.model)
+    wave = build_pp_wave(
         pp_group=scheduler.pp_group,
         stage_group=scheduler.tp_group,
         world_group=scheduler.world_group,
         rows=policy.max_padded_tokens(),
         hidden=int(model_runner.model_config.hidden_size),
+        num_aux=num_aux,
         dtype=model_runner.dtype,
         device=torch.device(model_runner.device),
     )
+    # A forward hands on its token bucket, or its batch bucket when decoding.
+    assert policy.t_bucketer is not None and policy.b_bucketer is not None
+    wave.warmup_merge({*policy.t_bucketer.buckets, *policy.b_bucketer.buckets})
+    if torch.device(model_runner.device).type != "cpu":
+        # torch_tpu compiles asynchronously; the checker must not count the warmups.
+        torch.accelerator.synchronize()
+    snapshot_recompilation_baseline()
+    return wave
 
 
 def decode_transfer_status(

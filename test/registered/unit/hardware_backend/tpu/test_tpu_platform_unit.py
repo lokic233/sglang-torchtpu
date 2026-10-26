@@ -6,12 +6,11 @@ These tests mock torch_tpu so they can run on any machine without TPU hardware.
 import builtins
 import os
 import sys
-import tempfile
 import unittest
-from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import torch
 import torch.compiler.config as compiler_config
 
 from sglang.srt.environ import envs
@@ -23,6 +22,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang_tpu.tpu_platform import (
     TpuSRTPlatform,
     _validate_decode_context_parallel,
@@ -100,23 +100,44 @@ class TestTpuPlatformInitialization(CustomTestCase):
         calls = []
         fake_torch_tpu = ModuleType("torch_tpu")
 
+        def prepare(world_size, **kwargs):
+            calls.append(("prepare", world_size, kwargs))
+            os.environ["LIBTPU_INIT_ARGS"] = "--xla_user=1 --xla_override=0"
+
         with (
-            patch.dict(os.environ, {"WORLD_SIZE": "16"}, clear=False),
+            patch.dict(
+                os.environ,
+                {"WORLD_SIZE": "16", "LIBTPU_INIT_ARGS": "--xla_user=1"},
+                clear=False,
+            ),
             patch.dict(sys.modules, {"torch_tpu": fake_torch_tpu}),
             compiler_config.patch(cache_key_tag=""),
             patch(
                 "sglang_tpu.patches._prepare_tpu_env",
-                side_effect=lambda world_size, **kwargs: calls.append(
-                    ("prepare", world_size, kwargs)
+                side_effect=prepare,
+            ),
+            patch(
+                "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key",
+                side_effect=lambda: calls.append(
+                    ("cache_key", os.environ["LIBTPU_INIT_ARGS"])
                 ),
             ),
             patch(
                 "sglang_tpu.patches.apply_tpu_patches",
                 side_effect=lambda: calls.append(("patch", None)),
             ),
+            patch(
+                "sglang_tpu.tpu_platform.rank_slice._load",
+                side_effect=lambda: calls.append(("rank_slice", None)),
+            ),
+            patch(
+                "sglang_tpu.tpu_platform.traced_rank._load",
+                side_effect=lambda: calls.append(("traced_rank", None)),
+            ),
         ):
             self.platform.init_backend()
 
+        # The compile cache key must see the flags _prepare_tpu_env appends.
         self.assertEqual(
             calls,
             [
@@ -125,50 +146,56 @@ class TestTpuPlatformInitialization(CustomTestCase):
                     16,
                     {"resolve_single_host_topology": True},
                 ),
+                ("cache_key", "--xla_user=1 --xla_override=0"),
                 ("patch", None),
+                ("rank_slice", None),
+                ("traced_rank", None),
             ],
         )
 
+    def test_reentry_during_model_registration_registers_once(self):
+        """init_backend re-entered while registering models (model_runner's OOT import
+        hook does this) must not register the TPU models a second time."""
+        registered = []
+
+        def register(package_name):
+            registered.append(package_name)
+            if len(registered) == 1:
+                self.platform.init_backend()
+
+        with (
+            patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False),
+            patch.dict(sys.modules, {"torch_tpu": ModuleType("torch_tpu")}),
+            patch("sglang_tpu.patches._prepare_tpu_env"),
+            patch(
+                "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key"
+            ),
+            patch("sglang_tpu.patches.apply_tpu_patches"),
+            patch("sglang_tpu.tpu_platform.rank_slice._load"),
+            patch("sglang_tpu.tpu_platform.traced_rank._load"),
+            patch(
+                "sglang.srt.models.registry.ModelRegistry.register",
+                side_effect=register,
+            ),
+        ):
+            self.platform.init_backend()
+
+        self.assertEqual(registered, ["sglang_tpu.models"])
+
 
 class TestTpuCompileCache(CustomTestCase):
-    def test_pallas_source_change_updates_compile_cache_key(self):
-        import sglang_tpu.compile_cache as compile_cache
+    def test_reports_tier1_cache_misses(self):
+        with patch.object(
+            torch,
+            "tpu",
+            SimpleNamespace(_get_cache_misses=lambda: 37),
+            create=True,
+        ):
+            self.assertEqual(TpuSRTPlatform().get_compilation_cache_misses(), 37)
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            package_root = Path(temp_dir)
-            source_files = (
-                package_root / "attention/pallas/kernel.py",
-                package_root / "moe/pallas/kernel.py",
-                package_root / "attention_pallas.py",
-                package_root / "attention_pallas_rpa_base.py",
-                package_root / "attention_pallas_rpa_batched.py",
-                package_root / "attention_pallas_rpa_v3.py",
-                package_root / "distributed_topk_pallas.py",
-                package_root / "kernels/distributed_topk.py",
-                package_root / "kernels/kernel.py",
-                package_root / "pallas_export.py",
-                package_root / "pallas_jax_op.py",
-                package_root / "quantized_matmul.py",
-            )
-            for source_file in source_files:
-                source_file.parent.mkdir(parents=True, exist_ok=True)
-                source_file.write_text("original source\n")
-
-            module_path = package_root / "compile_cache.py"
-            with (
-                patch.object(compile_cache, "__file__", str(module_path)),
-                compiler_config.patch(cache_key_tag="user-tag"),
-            ):
-                compile_cache.add_pallas_kernel_sources_to_compile_cache_key()
-                original_key = compiler_config.cache_key_tag
-
-                distributed_top_k_source = package_root / "kernels/distributed_topk.py"
-                distributed_top_k_source.write_text("changed source\n")
-                compile_cache.add_pallas_kernel_sources_to_compile_cache_key()
-                changed_key = compiler_config.cache_key_tag
-
-                self.assertTrue(original_key.startswith("user-tag|"))
-                self.assertNotEqual(changed_key, original_key)
+    def test_omits_cache_misses_when_runtime_has_no_counter(self):
+        with patch.object(torch, "tpu", SimpleNamespace(), create=True):
+            self.assertIsNone(TpuSRTPlatform().get_compilation_cache_misses())
 
 
 class TestTpuPlatformMemory(CustomTestCase):
@@ -216,10 +243,27 @@ class TestTpuPlatformMemory(CustomTestCase):
             self.assertEqual(free, 10 << 30)
 
 
+def _require_resolved_dp_layout(overrides):
+    """Platform defaults only ever see the resolved DP layout.
+
+    handle_deprecated_dp_attention rewrites `--dp-size N --enable-dp-attention`
+    to attn_dp_size=N, dp_size=1, enable_dp_attention=False before platform
+    defaults run. Handing the hook the deprecated spelling tests a state
+    production never reaches: these cases stayed green while the DP-attention
+    refusals they cover had stopped firing.
+    """
+    if overrides.get("enable_dp_attention"):
+        raise AssertionError(
+            "pass attn_dp_size=N: the pipeline resolves enable_dp_attention "
+            "before platform defaults run"
+        )
+
+
 class TestTpuPlatformServerDefaults(CustomTestCase):
     """apply_server_args_defaults sets correct values."""
 
     def _args(self, **overrides):
+        _require_resolved_dp_layout(overrides)
         # apply_server_args_defaults declares rather than writes, so the assertions read the
         # decisions back with resolution_result, as the projection does.
         defaults = dict(
@@ -251,11 +295,13 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             optimistic_prefill_attempts=0,
             max_queued_requests=None,
             enable_priority_scheduling=False,
+            disaggregation_enable_kv_checksum=False,
             dcp_size=1,
             attn_cp_size=1,
             enable_prefill_cp=False,
             enable_hierarchical_cache=False,
             tpu_compile_tracer="dynamo",
+            json_model_override_args=None,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -315,6 +361,31 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             with self.subTest(**overrides):
                 self._apply(self._args(**overrides))
 
+    def test_rejects_kv_checksum(self):
+        """The KV checksum is CUDA-only. On TPU the prefill passed its health
+        checks and then every rank died on the first real request (#1177)."""
+        for mode in ("prefill", "decode", "null"):
+            with self.subTest(mode=mode):
+                args = self._args(
+                    disaggregation_mode=mode,
+                    disaggregation_transfer_backend="raiden",
+                    disaggregation_enable_kv_checksum=True,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "--disaggregation-enable-kv-checksum is not supported on TPU",
+                ):
+                    self._apply(args)
+
+    def test_kv_checksum_off_allowed(self):
+        self._apply(
+            self._args(
+                disaggregation_mode="prefill",
+                disaggregation_transfer_backend="raiden",
+                disaggregation_enable_kv_checksum=False,
+            )
+        )
+
     def test_defaults_applied(self):
         args = self._args(enable_torch_compile=False)
         self._apply(args)
@@ -371,6 +442,13 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self.assertEqual(self._resolved(args, "kv_cache_dtype"), "auto")
         self.assertEqual(self._resolved(args, "page_size"), 64)
 
+    def test_sparse_mla_backend_defaults_kv_cache_to_fp8(self):
+        # Its kernels read an FP8 cache and nothing else, so "auto" cannot be
+        # left to mean the model dtype.
+        args = self._args(attention_backend="pallas_tpu_mla_sparse")
+        self._apply(args)
+        self.assertEqual(self._resolved(args, "kv_cache_dtype"), "fp8_e4m3")
+
     def test_batched_rpa_page_size_default_meets_the_kernel_floor(self):
         args = self._args(attention_backend="pallas_tpu_rpa_batched")
         self._apply(args)
@@ -399,14 +477,13 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
     def test_unsupported_builtin_spec_algorithm_is_rejected(self):
         args = self._args(speculative_algorithm="NGRAM")
-        with self.assertRaisesRegex(NotImplementedError, "only EAGLE3"):
+        with self.assertRaisesRegex(NotImplementedError, "only EAGLE"):
             self._apply(args)
 
     def test_dp_attention_requires_dp_lm_head_when_attn_tp_gt_1(self):
         args = self._args(
-            enable_dp_attention=True,
             tp_size=8,
-            dp_size=2,
+            attn_dp_size=2,
             enable_dp_lm_head=False,
         )
         with self.assertRaisesRegex(
@@ -417,21 +494,46 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
     def test_dp_attention_allows_valid_dp_lm_head_combos(self):
         # attn_tp_size > 1 with enable_dp_lm_head=True
         args = self._args(
-            enable_dp_attention=True,
             tp_size=8,
-            dp_size=2,
+            attn_dp_size=2,
             enable_dp_lm_head=True,
         )
         self._apply(args)
 
         # attn_tp_size == 1 with enable_dp_lm_head=False
         args = self._args(
-            enable_dp_attention=True,
             tp_size=8,
-            dp_size=8,
+            attn_dp_size=8,
             enable_dp_lm_head=False,
         )
         self._apply(args)
+
+    def test_shared_head_experimental_drafts_need_dp_lm_head_at_attn_tp_1(self):
+        """At attention TP 1 the target head shards over the full TP group, but these
+        drafts share it inside the attention-TP group: they would draft from one shard."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        for algorithm, enabled, error in (
+            ("DFLASH", True, True),
+            ("NEXTN", True, True),
+            ("EAGLE3", True, False),
+            ("DFLASH", False, False),
+        ):
+            args = self._args(
+                tp_size=8,
+                attn_dp_size=8,
+                enable_dp_lm_head=False,
+                speculative_algorithm=algorithm,
+            )
+            with (
+                self.subTest(algorithm=algorithm, enabled=enabled),
+                tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled),
+            ):
+                if error:
+                    with self.assertRaisesRegex(ValueError, "--enable-dp-lm-head"):
+                        self._apply(args)
+                else:
+                    self._apply(args)
 
     def test_configures_export_mesh_from_tp_size(self):
         args = self._args(tp_size=16)
@@ -570,7 +672,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
                 "bf16 KV cache fails in warmup for gpt-oss",
             ),
             (dict(speculative_algorithm="EAGLE3"), {}, "speculative decoding"),
-            (dict(enable_dp_attention=True, dp_size=8), {}, "DP attention"),
+            (dict(attn_dp_size=8), {}, "DP attention"),
             (dict(moe_dp_size=1), {}, "requires --moe-dp-size 8"),
             (dict(enable_torch_compile=False), {}, "requires --enable-torch-compile"),
             (dict(tpu_compile_tracer="direct"), {}, "requires --tpu-compile-tracer"),
@@ -597,11 +699,62 @@ class TestPrefillContextParallelValidation(CustomTestCase):
         )
 
 
+class TestDsaValidation(CustomTestCase):
+    """apply_server_args_defaults rejects the DSA setups TPU would serve wrongly."""
+
+    _args = TestTpuPlatformServerDefaults._args
+    _apply = TestTpuPlatformServerDefaults._apply
+
+    def _apply_dsa(
+        self, *, attention_backend, tpu_compile_tracer="dynamo", **config_fields
+    ):
+        args = self._args(
+            attention_backend=attention_backend,
+            tpu_compile_tracer=tpu_compile_tracer,
+            model_path="model",
+            trust_remote_code=False,
+            revision=None,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048, **config_fields
+        )
+        with patch(
+            "sglang.srt.utils.hf_transformers.config.get_config",
+            return_value=hf_config,
+        ):
+            self._apply(args)
+
+    def test_dsa_needs_the_sparse_backend_and_a_plain_top_k(self):
+        """TPU has one DSA backend, and its top-k kernel cannot force the
+        init/local positions in. Either mismatch must stop the launch: served
+        anyway, the model would attend over a different selection."""
+        self._apply_dsa(attention_backend="pallas_tpu_mla_sparse")
+        with self.assertRaisesRegex(ValueError, "pallas_tpu_mla_sparse"):
+            self._apply_dsa(attention_backend="pallas_tpu_mla")
+        for field in ("index_init_tokens", "index_local_tokens"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    self._apply_dsa(
+                        attention_backend="pallas_tpu_mla_sparse", **{field: 4}
+                    )
+
+    def test_dsa_needs_the_dynamo_tracer(self):
+        """The direct tracer reads the KV cache through the pool's get_state,
+        which the split MLA pool does not implement. The launch must say so
+        instead of failing at the first compile."""
+        with self.assertRaisesRegex(ValueError, "tpu-compile-tracer dynamo"):
+            self._apply_dsa(
+                attention_backend="pallas_tpu_mla_sparse",
+                tpu_compile_tracer="direct",
+            )
+
+
 class TestTpuPlatformDecodeContextParallel(CustomTestCase):
     """Decode context parallel is admitted only for the configuration the TPU
     batched RPA backend implements; every other combination is refused by name."""
 
     def _args(self, **overrides):
+        _require_resolved_dp_layout(overrides)
         defaults = dict(
             attention_backend="pallas_tpu_rpa_batched",
             tp_size=8,
@@ -618,6 +771,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             optimistic_prefill_attempts=0,
             max_queued_requests=None,
             enable_priority_scheduling=False,
+            disaggregation_enable_kv_checksum=False,
             enable_hierarchical_cache=False,
             dcp_comm_backend="ag_rs",
             dcp_replicate_q_proj=False,
@@ -668,7 +822,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
                 dcp_size=1,
                 attention_backend="pallas_tpu_rpa_v3",
                 pp_size=2,
-                enable_dp_attention=True,
+                attn_dp_size=2,
                 enable_torch_compile=False,
             )
         )
@@ -701,9 +855,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
                 self._assert_refused("(?i)kv[-_ ]cache[-_ ]dtype", kv_cache_dtype=dtype)
 
     def test_refuses_dp_attention(self):
-        self._assert_refused(
-            "(?i)dp[-_ ]attention", enable_dp_attention=True, dp_size=2
-        )
+        self._assert_refused("(?i)dp[-_ ]attention", attn_dp_size=2)
 
     def test_refuses_prefill_context_parallelism(self):
         self._assert_refused(
@@ -813,7 +965,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
         # The gate has to be wired into apply_server_args_defaults, or a bad
         # configuration reaches the model runner.
         platform = TpuSRTPlatform()
-        args = self._args(enable_dp_attention=True, dp_size=2, enable_dp_lm_head=True)
+        args = self._args(attn_dp_size=2, enable_dp_lm_head=True)
         with (
             patch("sglang_tpu.patches._prepare_tpu_env"),
             patch.dict(os.environ, {"SGLANG_TPU_REQ_TO_TOKEN_ON_HOST": "1"}),
@@ -846,13 +998,138 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 
-    def test_nsa_raises(self):
-        with self.assertRaises(NotImplementedError):
-            self.platform.get_nsa_kv_pool_cls()
+    def test_dsa_pool_is_the_split_pool(self):
+        cls = self.platform.get_dsa_kv_pool_cls()
+        self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
+
+    def test_draft_backends_run_their_target_backend_per_step(self):
+        from sglang.srt.layers.attention import attention_registry as registry
+        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+        from sglang_tpu.attention_pallas_mla_sparse import (
+            TpuPallasSparseMlaAttnBackend,
+        )
+        from sglang_tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedAttnBackend,
+        )
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+        from sglang_tpu.tpu_platform import _register_attention_backends
+
+        expected = {
+            "pallas_tpu_rpa_v3": TpuPallasRpaV3AttnBackend,
+            "pallas_tpu_rpa_batched": TpuPallasRpaBatchedAttnBackend,
+            "pallas_tpu_mla": TpuPallasMlaAttnBackend,
+            "pallas_tpu_mla_sparse": TpuPallasSparseMlaAttnBackend,
+        }
+        with (
+            patch.dict(registry.ATTENTION_BACKENDS),
+            patch.dict(registry.DRAFT_ATTENTION_BACKENDS, clear=True),
+        ):
+            _register_attention_backends()
+            self.assertEqual(set(registry.DRAFT_ATTENTION_BACKENDS), set(expected))
+            for name, attn_backend_cls in expected.items():
+                with self.subTest(backend=name):
+                    # The draft extend builds the target backend of the same name.
+                    self.assertIn(name, registry.ATTENTION_BACKENDS)
+                    with patch.object(
+                        attn_backend_cls, "__init__", return_value=None
+                    ) as init:
+                        container = registry.DRAFT_ATTENTION_BACKENDS[name](
+                            "runner", 1, 4
+                        )
+                    self.assertEqual(len(container.attn_backends), 3)
+                    self.assertTrue(
+                        all(
+                            type(c) is attn_backend_cls for c in container.attn_backends
+                        )
+                    )
+                    self.assertEqual(
+                        [c.kwargs["speculative_step_id"] for c in init.call_args_list],
+                        [0, 1, 2],
+                    )
 
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
             self.platform.get_piecewise_backend_cls()
+
+
+def _built_bytes_per_token(pool_cls, *, num_kv_heads, head_dim, v_head_dim, dtype):
+    """Per-token, per-layer bytes of a pool actually built on the CPU."""
+    page_size = 16
+    pool = pool_cls(
+        size=4 * page_size,
+        page_size=page_size,
+        dtype=dtype,
+        head_num=num_kv_heads,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        layer_num=1,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    buf = pool.kv_buffer[0]
+    return buf.numel() * buf.element_size() // (pool.num_blocks * page_size)
+
+
+class TestTpuKvPoolBytesPerToken(CustomTestCase):
+    """The KV budget is spent before any pool exists, so each pool's
+    ``kv_bytes_per_token_per_layer`` must track its ``_create_buffers``."""
+
+    def _check(self, pool_cls, expected, **shape):
+        dtype = shape.pop("dtype")
+        per_token = pool_cls.kv_bytes_per_token_per_layer(**shape, store_dtype=dtype)
+        self.assertEqual(per_token, expected)
+        self.assertEqual(
+            per_token, _built_bytes_per_token(pool_cls, **shape, dtype=dtype)
+        )
+
+    def test_head_dim_64_is_priced_at_the_padded_width(self):
+        """Bug regression: sizing priced heads * (head_dim + v_head_dim) while the
+        fused pool pads head_dim 64 to 128, so the pool was twice its budget."""
+        self._check(
+            TpuFusedMHATokenToKVPool,
+            8 * 2 * 128 * 2,
+            num_kv_heads=8,
+            head_dim=64,
+            v_head_dim=64,
+            dtype=torch.bfloat16,
+        )
+
+    def test_fp8_rounds_the_head_axis_up_to_the_lane_packing(self):
+        """fp8 packs 4 per 32-bit lane, so one KV head's K/V axis rounds 2 up to 4
+        on top of the head_dim padding."""
+        for heads in (1, 2):
+            self._check(
+                TpuFusedMHATokenToKVPool,
+                4 * 128,
+                num_kv_heads=heads,
+                head_dim=64,
+                v_head_dim=64,
+                dtype=torch.float8_e4m3fn,
+            )
+
+    def test_v_is_stored_at_the_padded_qk_width(self):
+        """The fused pool stores V in a slot of the padded qk width, so the
+        footprint is flat in v_head_dim, unlike head_dim + v_head_dim."""
+        for v_head_dim in (192, 128):
+            self._check(
+                TpuFusedMHATokenToKVPool,
+                8 * 256 * 2,
+                num_kv_heads=4,
+                head_dim=192,
+                v_head_dim=v_head_dim,
+                dtype=torch.bfloat16,
+            )
+
+    def test_platform_prices_only_the_padding_pools(self):
+        """A pool without padding reports None, so sizing keeps the generic formula."""
+        platform = TpuSRTPlatform()
+        shape = dict(
+            num_kv_heads=8, head_dim=64, v_head_dim=64, kv_cache_dtype=torch.bfloat16
+        )
+        with get_context().override_server_args(attention_backend="torch_native"):
+            self.assertIsNone(platform.get_mha_kv_bytes_per_token(**shape))
+        with get_context().override_server_args(attention_backend="pallas_tpu_rpa_v3"):
+            self.assertEqual(platform.get_mha_kv_bytes_per_token(**shape), 4096)
 
 
 if __name__ == "__main__":

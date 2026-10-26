@@ -191,17 +191,12 @@ class TestTpuOOTPlatformContract(CustomTestCase):
     # -- DSA / sparse attention -------------------------------------------
 
     def test_dsa_kv_pool_cls_fails_with_a_tpu_specific_message(self):
-        """TPU has no DSA pool; the refusal must name TPU, not be the base stub."""
+        """Mode B has no DSA pool yet; the refusal must name TPU, not be the base stub."""
         owner = _defining_class(self.TpuOOTPlatform, "get_dsa_kv_pool_cls")
         self.assertIn(owner, self.tpu_owned)
         with self.assertRaises(NotImplementedError) as caught:
             self.platform.get_dsa_kv_pool_cls()
         self.assertIn("TPU", str(caught.exception))
-
-    def test_nsa_kv_pool_cls_is_also_a_refusal(self):
-        """Neither spelling has a pool."""
-        with self.assertRaises(NotImplementedError):
-            self.platform.get_nsa_kv_pool_cls()
 
     # -- speculative decoding ---------------------------------------------
 
@@ -216,18 +211,25 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             f"unknown algorithms claimed: {sorted(_SUPPORTED_SPEC_ALGORITHMS - known)}",
         )
 
-    def test_dspark_is_deliberately_not_claimed(self):
-        """DSPARK is in flight; delete this test when it is tested on TPU."""
-        self.assertFalse(self.platform.supports_speculative_algorithm("DSPARK"))
+    def test_dspark_is_claimed_only_with_experimental_spec_worker(self):
+        """DSPARK is served by TpuBlockSpecWorker when the experimental spec worker is enabled."""
+        from sglang_tpu.envs import envs
 
-    def test_claimed_draft_backends_are_registered_by_draft_utils(self):
+        self.assertTrue(self.platform.supports_speculative_algorithm("DSPARK"))
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            self.assertFalse(self.platform.supports_speculative_algorithm("DSPARK"))
+
+    def test_claimed_draft_backends_are_registered(self):
         from sglang_tpu.platform import _SUPPORTED_DRAFT_ATTENTION_BACKENDS
 
-        missing = _SUPPORTED_DRAFT_ATTENTION_BACKENDS - self._draft_backend_keys()
+        missing = _SUPPORTED_DRAFT_ATTENTION_BACKENDS - (
+            self._draft_backend_keys() | self._registered_draft_backends()
+        )
         self.assertEqual(
             missing,
             set(),
-            f"claimed draft backends draft_utils does not register: {sorted(missing)}",
+            "claimed draft backends neither draft_utils nor the plugin's draft "
+            f"registry provides: {sorted(missing)}",
         )
 
     def test_default_draft_backend_matches_the_core_default(self):
@@ -333,17 +335,144 @@ class TestTpuOOTPlatformContract(CustomTestCase):
     def test_scheduler_initialization_hook_is_declared(self):
         from sglang.srt.plugins.hook_registry import HookType
         from sglang_tpu.hooks import HOOKS
+        from sglang_tpu.hooks.attn_residual import (
+            aggregate,
+            aggregate_fused_add,
+            prepare_attn_residual_kernel,
+            register_attn_residual_ops,
+        )
+        from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
+        from sglang_tpu.hooks.moe_topk import (
+            biased_grouped_topk,
+            biased_topk,
+            register_router_topk,
+        )
+        from sglang_tpu.hooks.pipeline_parallel import (
+            check_pipeline_parallel_compat,
+            skip_spec_op_precompile_without_draft,
+        )
         from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+        from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
+        from sglang_tpu.hooks.twolevel_allreduce import (
+            all_reduce as twolevel_all_reduce,
+        )
+        from sglang_tpu.hooks.twolevel_allreduce import (
+            merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
+        )
 
-        self.assertEqual(
+        self.assertIn(
+            (
+                "sglang.srt.layers.layer_boundary.adapters.attention."
+                "_device_supports_input_scattered",
+                device_supports_input_scattered,
+                HookType.AROUND,
+            ),
             HOOKS,
-            [
-                (
-                    "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
-                    initialize_dense_moe_config,
-                    HookType.AFTER,
-                )
-            ],
+        )
+        self.assertIn(
+            (
+                "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
+                initialize_dense_moe_config,
+                HookType.AFTER,
+            ),
+            HOOKS,
+        )
+
+        self.assertIn(
+            (
+                "sglang.srt.arg_groups.validation_hook.check_pipeline_parallel_compat",
+                check_pipeline_parallel_compat,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
+                skip_spec_op_precompile_without_draft,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
+                twolevel_all_reduce,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
+                twolevel_merged_moe_all_reduce,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.moe.topk.TopK.__init__",
+                register_router_topk,
+                HookType.AFTER,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.moe.topk.biased_topk_impl",
+                biased_topk,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.moe.topk.biased_grouped_topk_impl",
+                biased_grouped_topk,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+                bind_kimi_k3_static_fp8,
+                HookType.AFTER,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.KimiK3LinearModel.__init__",
+                register_attn_residual_ops,
+                HookType.AFTER,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+                prepare_attn_residual_kernel,
+                HookType.AFTER,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.attn_residual._aggregate",
+                aggregate,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.attn_residual._aggregate_fused_add",
+                aggregate_fused_add,
+                HookType.AROUND,
+            ),
+            HOOKS,
         )
 
     # -- helpers -----------------------------------------------------------
@@ -352,6 +481,23 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         path = os.path.join(_REPO_ROOT, "python", "sglang", "srt", relpath)
         with open(path, "r", encoding="utf-8") as handle:
             return handle.read()
+
+    def _registered_draft_backends(self) -> set:
+        """Names sglang_tpu registers with register_draft_attention_backend."""
+        path = os.path.join(_REPO_ROOT, "sglang_tpu", "tpu_platform.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        names = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "register_draft_attention_backend"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                names.add(node.args[0].value)
+        return names
 
     def _draft_backend_keys(self) -> set:
         """Dispatch-dict keys in speculative/draft_utils.py, parsed not imported."""
@@ -567,6 +713,7 @@ class TestTpuDebtRatchet(CustomTestCase):
 ADDED_BY_PATCHES = {
     "sglang.srt.managers.overlap_utils.FutureMap.tpu_direct_handoff",
     "sglang.srt.managers.overlap_utils.FutureMap.tpu_published_seq_lens",
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache._write_back_copy_ahead",
 }
 
 

@@ -375,6 +375,9 @@ class Envs:
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    # Opt-in multi-node TP: broadcast requests to node leaders, then share multimodal
+    # tensors with the other ranks on each node through /dev/shm.
+    SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST = EnvBool(False)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
     # When set, get_open_port() and shm_broadcast search upwards from this
@@ -688,12 +691,19 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Hybrid-SWA unified cache: insert a mid-prefill chunk only if it reaches a
+    # multiple of this many tokens (0: every chunk); each insert pins an SWA window.
+    SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE = EnvInt(0)
+    # Move the stale SWA windows a chunked request leaves behind its sliding window
+    # to the SWA LRU eviction end, ahead of shared windows and prefix tails.
+    SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST = EnvBool(False)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
     # - C128 or other unsupported components.
     # - Custom component overrides.
+    # - SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST on an SWA cache.
     # - Non-Linux platforms.
     # - Unsupported PyTorch versions.
     # - Devices other than CPU or CUDA.
@@ -751,6 +761,19 @@ class Envs:
     SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S = EnvFloatWithAlias(
         60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
     )
+    # Pipeline prefill: move pages final before the prefill ends (cached prefix,
+    # finished chunks) as early transfers of at least PART_PAGES pages each.
+    SGLANG_RAIDEN_PIPELINE_EARLY_PARTS = EnvBool(False)
+    SGLANG_RAIDEN_PIPELINE_PART_PAGES = EnvInt(16)
+    # Pipeline prefill: each group of STAGE_GROUP consecutive stages moves its
+    # layers once its forwards of the final chunk complete, before sampling.
+    SGLANG_RAIDEN_PIPELINE_STAGE_PARTS = EnvBool(False)
+    SGLANG_RAIDEN_PIPELINE_STAGE_GROUP = EnvInt(1)
+    # Decode: threads coordinating pipeline transfers, one client each.
+    SGLANG_RAIDEN_PIPELINE_COORD_WORKERS = EnvInt(1)
+    # Pipeline prefill: each stage registers its share of the closing transfer
+    # at the final chunk's launch, the last stage once its tokens are copied.
+    SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE = EnvBool(False)
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )
@@ -1432,6 +1455,12 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Shard the DFLASH draft's context projection (K * hidden -> hidden) across TP by its
+    # input dim instead of replicating it; same math plus one all-reduce.
+    SGLANG_DFLASH_ROW_PARALLEL_FC = EnvBool(False)
+    # DFlash2 conv on flat [tokens, hidden] rows, the per-group deltas widened to channels
+    # by one exact 0/1 matmul per sublayer; needs groups to be a multiple of 128.
+    SGLANG_DFLASH_CONV_MATMUL_EXPAND = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
@@ -1844,6 +1873,10 @@ class Envs:
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # Reduce K3's TP-partial routed latent and shared-expert output with one
+    # collective (kimi_k3.merged_moe_all_reduce) instead of two. Platforms may
+    # serve it with a multi-tensor collective; the default concatenates.
+    SGLANG_K3_MERGE_MOE_ALLREDUCE = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
@@ -1904,9 +1937,6 @@ class Envs:
     # Restore device MM scatter instead of host placement.
     # https://github.com/sgl-project/sglang-torchtpu/issues/741
     SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)
-    # Opt in to host padding for small prefill metadata tensors to avoid
-    # per-length XLA compilations.
-    SGLANG_TPU_HOST_PADDING = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     # Also attribute eager compiles to sglang source lines. ~9 us per eager op.
     SGLANG_TPU_CHECK_RECOMPILATION_SITES = EnvBool(False)
@@ -1970,7 +2000,9 @@ class Envs:
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
-    # and tune from there.
+    # and tune from there. Below it, batches of up to 2048 routed rows also
+    # take the sort-free dense rank route, and one-token batches the
+    # route-meta kernel.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap).
@@ -1981,6 +2013,9 @@ class Envs:
     # xprof python tracer. Off by default: it dominates host busy time.
     SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
     # raiden KV-offload backend
+    # Seconds a raiden DMA may stay pending, from each blocking wait or, when
+    # polled, from issue. Past it the scheduler exits with TimeoutError, so keep
+    # it far above a healthy transfer.
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
     SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS = EnvBool(True)

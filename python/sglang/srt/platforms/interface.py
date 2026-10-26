@@ -12,6 +12,7 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
@@ -50,6 +51,24 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
+    supports_mamba_extra_buffer: bool = False
+
+    def supports_mamba_prefix_cache(self, model_config) -> bool:
+        """Whether this model's recurrent backend can reuse prefix checkpoints.
+
+        Called for models with recurrent state. Preserve the shared cache
+        behavior by default; plugins may restrict their supported backends.
+        """
+        return True
+
+    def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
+        """Validate platform-specific recurrent prefix-cache constraints.
+
+        ``hf_config`` is provided for extra-buffer strategies. The default
+        adds no restrictions to the shared backend validation.
+        """
+        pass
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------
@@ -74,6 +93,19 @@ class SRTPlatform(DeviceMixin):
         """Return the MHA KV pool class for this platform."""
         raise NotImplementedError
 
+    def get_mha_kv_bytes_per_token(
+        self,
+        *,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        kv_cache_dtype: torch.dtype,
+    ) -> Optional[int]:
+        """Per-token, per-layer bytes of this platform's MHA pool; ``None`` means
+        the generic ``num_kv_heads * (head_dim + v_head_dim) * itemsize``."""
+        del num_kv_heads, head_dim, v_head_dim, kv_cache_dtype
+        return None
+
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         """Return the host (L2) MHA KV pool class matching ``device_pool``.
 
@@ -85,6 +117,15 @@ class SRTPlatform(DeviceMixin):
         from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 
         return get_mha_host_pool_cls(device_pool)
+
+    def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
+        """Scope host-pool construction for an explicit HiCache ratio or size.
+
+        The context covers target and draft pools. By default, each host pool
+        performs its own admission check; platforms may share a budget instead.
+        Automatic sizing manages its own budget and does not call this hook.
+        """
+        return nullcontext()
 
     def get_mamba_pool_cls(self) -> type:
         """Return the recurrent (GDN / mamba) state pool class for this platform."""
@@ -121,9 +162,30 @@ class SRTPlatform(DeviceMixin):
         """
         return "inductor"
 
+    def get_batch_input_device(self, batch) -> Optional[str]:
+        """Placement of host-created forward inputs before backend preparation.
+
+        None preserves each caller's normal device. Scheduler state and
+        device-produced tokens keep their own devices.
+        """
+        return None
+
     def supports_torch_compile(self) -> bool:
         """Whether this platform consumes annotation-driven compile policies."""
         return False
+
+    def get_traced_rank(
+        self, rank: int, *, group_size: int | None = None
+    ) -> torch.Tensor | None:
+        """Return the traced rank, optionally within a contiguous parallel group."""
+        return None
+
+    def slice_tensor_for_rank(
+        self, tensor: torch.Tensor, dim: int, parts: int, rank: int
+    ) -> torch.Tensor:
+        """Select one evenly divided tensor shard for this rank."""
+        assert tensor.shape[dim] % parts == 0
+        return tensor.split(tensor.shape[dim] // parts, dim=dim)[rank].contiguous()
 
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform."""
@@ -161,6 +223,13 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports a draft backend for an algorithm."""
         return False
 
+    def supports_speculative_dp_attention(self, algorithm: str) -> bool:
+        """Whether this platform serves the named speculative algorithm under DP attention.
+
+        Consulted only where core rejects an algorithm with DP attention by default.
+        """
+        return False
+
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.
@@ -194,6 +263,11 @@ class SRTPlatform(DeviceMixin):
         devices (--moe-dp-size > 1 with --pp-size > 1)."""
         return False
 
+    def keeps_swa_index_mapping_on_host(self) -> bool:
+        """Whether the SWA allocator's full-to-SWA index mapping is host-resident,
+        so SWA segment frees require host indices."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
@@ -207,6 +281,18 @@ class SRTPlatform(DeviceMixin):
         a forward (the server warmup request has drained). Platforms that
         compile ahead of serving freeze or monitor compilation here."""
         pass
+
+    def get_compilation_cache_misses(self) -> Optional[int]:
+        """Return a monotonic platform compilation-cache miss counter.
+
+        A platform may return ``None`` when its runtime exposes no such
+        counter. Implementations should not synchronize device execution.
+        """
+        return None
+
+    def get_recompilation_counters(self) -> dict[str, Any]:
+        """Return platform-specific serving-time compilation counters for internal state readback."""
+        return {}
 
     # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
     # entry until the seam PR merges upstream.

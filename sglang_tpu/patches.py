@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU compatibility patches for SGLang.
 
-Ported from https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/platforms/tpu_platform.py.
+Ported from https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/platforms/tpu_platform.py.
 Must run in every process (including spawned workers) because
 module-level state is re-initialized on import in spawned processes.
 All patches are idempotent.
@@ -47,6 +47,7 @@ _IMPORTANT_TPU_ENV_VARS = (
     "LIBTPU_INIT_ARGS",
     "XLA_FLAGS",
     "SGLANG_NATIVE_MOVE_KV_CACHE",
+    "TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS",
 )
 
 
@@ -636,9 +637,12 @@ _support_triton_patched = False
 
 _PALLAS_TPU_BACKENDS = (
     "pallas_tpu_flash",
+    "dsv4",
+    "tpu_dsv4",
     "pallas_tpu_rpa_v3",
     "pallas_tpu_rpa_batched",
     "pallas_tpu_mla",
+    "pallas_tpu_mla_sparse",
 )
 
 
@@ -800,15 +804,13 @@ def _patch_raiden_is_load_back_event_done() -> None:
     _raiden_is_load_back_event_done_patched = True
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from sglang_tpu.raiden_hybrid_cache_controller import (
-        TpuRaidenHybridCacheController,
-    )
+    from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
     orig_is_load_back_event_done = UnifiedRadixCache.is_load_back_event_done
 
     def is_load_back_event_done(self, consumer_index):
         controller = self.cache_controller
-        if not isinstance(controller, TpuRaidenHybridCacheController):
+        if not isinstance(controller, TpuDMAHybridCacheController):
             return orig_is_load_back_event_done(self, consumer_index)
         return controller.is_load_back_event_done(consumer_index, self._all_reduce)
 
@@ -868,11 +870,22 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
 def _patch_pd_decode_swa_hicache() -> None:
     """Allow PD decode prefix cache + RAM offload on sliding-window models.
 
-    Only full-attention KV goes to RAM. See ``pd_decode_swa_hicache``.
+    Only full-attention KV goes to RAM. Also hold PD decode requests that reuse
+    an unfinished raiden restore, on any model. See ``pd_decode_swa_hicache``.
     """
     from sglang_tpu import pd_decode_swa_hicache
 
     pd_decode_swa_hicache.install()
+
+
+def _patch_hicache_write_back_copy_ahead() -> None:
+    """Copy the next eviction victims to host ahead of raiden write_back evictions.
+
+    See ``hicache_write_back_copy_ahead``.
+    """
+    from sglang_tpu import hicache_write_back_copy_ahead
+
+    hicache_write_back_copy_ahead.install()
 
 
 def _patch_pd_decode_async_prefill_info() -> None:
@@ -893,6 +906,16 @@ def _patch_host_heap_trim() -> None:
     from sglang_tpu import host_heap_trim
 
     host_heap_trim.install()
+
+
+def _patch_profile_auto() -> None:
+    """Arm a staged xprof capture at launch under SGLANG_TPU_ENABLE_PROFILE_AUTO.
+
+    See ``profile_auto``.
+    """
+    from sglang_tpu import profile_auto
+
+    profile_auto.install()
 
 
 def _patch_scheduler_reject_prompt_logprob() -> None:
@@ -960,7 +983,9 @@ def apply_tpu_patches() -> None:
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
+    _patch_hicache_write_back_copy_ahead()
     _patch_pd_decode_async_prefill_info()
     _patch_host_heap_trim()
+    _patch_profile_auto()
     _patch_scheduler_reject_prompt_logprob()
     _patch_pd_decode_door_admission()

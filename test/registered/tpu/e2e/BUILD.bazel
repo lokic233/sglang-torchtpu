@@ -33,6 +33,25 @@ sglang_tpu_e2e_test(
     ],
 )
 
+# Imports the default-worker test above by its top-level name and flips
+# SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.
+sglang_tpu_e2e_test(
+    name = "test_tpu_gpt_oss_120b_singlehost_spec_experimental",
+    srcs = [
+        "test_tpu_gpt_oss_120b_singlehost_spec.py",
+        "test_tpu_gpt_oss_120b_singlehost_spec_experimental.py",
+    ],
+    data = ["//benchmark/tpu:runtime"],
+    main = "test_tpu_gpt_oss_120b_singlehost_spec_experimental.py",
+    tags = [
+        "requires-tpu-v7x",
+    ],
+    deps = [
+        "//python:tpu_launcher_test_support",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+)
+
 sglang_tpu_e2e_test(
     name = "test_tpu_gpt_oss_120b_singlehost_dpa",
     srcs = ["test_tpu_gpt_oss_120b_singlehost_dpa.py"],
@@ -82,30 +101,6 @@ sglang_tpu_e2e_test(
 )
 
 sglang_tpu_e2e_test(
-    name = "test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large",
-    srcs = ["test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large.py"],
-    data = ["//benchmark/tpu:runtime"],
-    main = "test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large.py",
-    tags = ["requires-tpu-v7x"],
-    deps = [
-        "//python:sglang",
-        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
-    ],
-)
-
-sglang_tpu_e2e_test(
-    name = "test_tpu_qwen3_0_6b_singlehost_prefix_cache",
-    srcs = ["test_tpu_qwen3_0_6b_singlehost_prefix_cache.py"],
-    data = ["//benchmark/tpu:runtime"],
-    main = "test_tpu_qwen3_0_6b_singlehost_prefix_cache.py",
-    tags = ["requires-tpu-v7x"],
-    deps = [
-        "//python:sglang",
-        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
-    ],
-)
-
-sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_0_6b_singlehost_prompt_logprob",
     srcs = ["test_tpu_qwen3_0_6b_singlehost_prompt_logprob.py"],
     data = ["//benchmark/tpu:runtime"],
@@ -149,18 +144,6 @@ sglang_tpu_e2e_test(
     srcs = ["test_tpu_qwen3_coder_480b_singlehost_prefix_cache_kv_offload_gsm8k.py"],
     data = ["//benchmark/tpu:runtime"],
     main = "test_tpu_qwen3_coder_480b_singlehost_prefix_cache_kv_offload_gsm8k.py",
-    tags = ["requires-tpu-v7x"],
-    deps = [
-        "//python:sglang",
-        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
-    ],
-)
-
-sglang_tpu_e2e_test(
-    name = "test_tpu_qwen3_coder_480b_singlehost_spec_decoding_gsm8k",
-    srcs = ["test_tpu_qwen3_coder_480b_singlehost_spec_decoding_gsm8k.py"],
-    data = ["//benchmark/tpu:runtime"],
-    main = "test_tpu_qwen3_coder_480b_singlehost_spec_decoding_gsm8k.py",
     tags = ["requires-tpu-v7x"],
     deps = [
         "//python:sglang",

@@ -7,22 +7,30 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import json
 import os
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional, Type
+from contextlib import AbstractContextManager, contextmanager
+from typing import TYPE_CHECKING, Any, Optional, Type
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
+from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
 
 logger = get_logger(__name__)
+
+
+# Platform discovery runs before worker bootstrap configures torch_tpu.
+rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
+traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
 
 
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
@@ -166,7 +174,7 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
         )
     if cfg.speculative_algorithm is not None:
         raise NotImplementedError(f"{feature} does not support speculative decoding.")
-    if cfg.enable_dp_attention:
+    if cfg.attn_dp_size > 1:
         raise NotImplementedError(f"{feature} does not support DP attention.")
     if cfg.moe_dp_size != attn_cp_size:
         raise NotImplementedError(
@@ -260,18 +268,18 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
     """Reject server configurations pipeline parallelism on TPU cannot run,
     and pin the scheduler order the stage hand-off needs.
 
-    Every device is one process, and a stage is one device or one
-    context-parallel group of devices. Activations move over
+    Every device is one process, and a stage is one device, a tensor-parallel
+    pair (--tp-size 2 with --attn-cp-size 1) or one prefill context-parallel
+    group (--tp-size equal to --attn-cp-size). Activations move over
     ICI as one collective-permute launched by every stage in lockstep, so a
     stage's forward waits on launches the other stages issue at the top of
     their next iteration. The scheduler must therefore receive and forward
     the last stage's outputs before it launches a forward, not after: that is
     the async-batch-depth 1 order (depth 0 does the ring exchange after the
-    forward and the two waits form a cycle). A stage may span several devices
-    only as a prefill context-parallel group (--tp-size equal to
-    --attn-cp-size): its collectives then run over the stage's own devices
-    (this needs a torch_tpu that compiles a collective for its device group
-    only), while the hand-off stays the one collective every stage launches.
+    forward and the two waits form a cycle). A stage of several devices runs
+    its own collectives over the stage's devices (this needs a torch_tpu that
+    compiles a collective for its device group only), while the hand-off
+    stays the one collective every stage launches.
     """
     from sglang.srt.arg_groups.overrides import (
         declare_resolution,
@@ -295,11 +303,19 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         declare_resolution(
             server_args, "tpu.apply_server_args_defaults", pp_async_batch_depth=1
         )
-    if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size:
+    stage_is_tp_pair = (
+        cfg.tp_size == 2
+        and cfg.attn_cp_size == 1
+        and cfg.attn_dp_size == 1
+        and cfg.ep_size == 1
+    )
+    if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size and not stage_is_tp_pair:
         raise NotImplementedError(
-            "Pipeline parallelism on TPU requires --tp-size 1 or --attn-cp-size "
-            f"equal to --tp-size (got --tp-size {cfg.tp_size} with --attn-cp-size "
-            f"{cfg.attn_cp_size} and --pp-size {pp})."
+            "Pipeline parallelism on TPU requires --tp-size 1, a tensor-parallel "
+            "pair (--tp-size 2 with --attn-cp-size 1, no DP attention or expert "
+            "parallelism) or --attn-cp-size equal to --tp-size (got --tp-size "
+            f"{cfg.tp_size} with --attn-cp-size {cfg.attn_cp_size} and --pp-size "
+            f"{pp})."
         )
     if cfg.dcp_size > 1:
         raise NotImplementedError(
@@ -329,11 +345,14 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
             declare_resolution(
                 server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="bfloat16"
             )
-    if cfg.speculative_algorithm is not None:
+    # PD prefill only exports the target's hidden states for the decode node;
+    # the draft loop itself never runs here, so the stage relay stays spec-free.
+    if cfg.speculative_algorithm is not None and cfg.disaggregation_mode != "prefill":
         raise NotImplementedError(
             "Speculative decoding "
             f"(--speculative-algorithm {cfg.speculative_algorithm}) "
-            f"is not supported with pipeline parallelism on TPU (--pp-size {pp})."
+            f"is not supported with pipeline parallelism on TPU (--pp-size {pp}) "
+            "outside --disaggregation-mode prefill."
         )
     if cfg.enable_dynamic_chunking:
         raise NotImplementedError(
@@ -373,6 +392,17 @@ def _validate_raiden_optimistic_prefill(
     )
 
 
+def _validate_kv_checksum(enable_kv_checksum: bool) -> None:
+    if not enable_kv_checksum:
+        return
+    raise ValueError(
+        "--disaggregation-enable-kv-checksum is not supported on TPU: the KV "
+        "checksum has only a CUDA implementation. On TPU the server would pass "
+        "its health checks and then fail every rank on the first real request. "
+        "Remove the flag from both the prefill and the decode engines."
+    )
+
+
 def _apply_page_size_default(server_args) -> None:
     """Resolve ``page_size`` against the attention backend's declared floor.
 
@@ -404,7 +434,7 @@ def _apply_page_size_default(server_args) -> None:
 
 
 def _apply_kv_cache_dtype_default(server_args) -> None:
-    """Default the KV cache to fp8 for the Pallas RPA backends.
+    """Default the KV cache to fp8 for the Pallas RPA/DSA backends.
 
     Those kernels dequantize KV on read, and at the head counts TPU serving
     runs (tensor parallel leaves one KV head per rank) fp8 halves KV bytes per
@@ -426,11 +456,134 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "auto":
         return
-    if _rpa_kernel_spec(cfg.attention_backend) is None:
+    if (
+        _rpa_kernel_spec(cfg.attention_backend) is None
+        and cfg.attention_backend != "pallas_tpu_mla_sparse"
+    ):
         return
     declare_resolution(
         server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="fp8_e4m3"
     )
+
+
+def _validate_dsa(server_args) -> None:
+    """Reject the sparse-attention (DSA) setups that TPU cannot serve correctly."""
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.utils.hf_transformers.config import get_config
+
+    cfg = resolving_view(server_args)
+    try:
+        hf_config = get_config(
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.revision,
+            model_override_args=json.loads(cfg.json_model_override_args or "{}"),
+        )
+    except Exception:
+        # A model that cannot be loaded here fails later with its real error.
+        return
+    if not is_deepseek_dsa(hf_config):
+        return
+    if cfg.attention_backend != "pallas_tpu_mla_sparse":
+        raise ValueError(
+            "Sparse attention (DSA) on TPU needs --attention-backend "
+            f"pallas_tpu_mla_sparse, got {cfg.attention_backend!r}."
+        )
+    # With these two settings the GPU indexer always keeps the first
+    # index_init_tokens and the last index_local_tokens positions. The TPU
+    # top-k kernel cannot do that yet, and ignoring them would change the
+    # selection without any error.
+    # TODO(sglang-torchtpu#1072): support them on TPU.
+    init_tokens = getattr(hf_config, "index_init_tokens", 0)
+    local_tokens = getattr(hf_config, "index_local_tokens", 0)
+    if init_tokens or local_tokens:
+        raise ValueError(
+            "DSA on TPU does not support index_init_tokens or index_local_tokens "
+            f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
+        )
+    # The direct tracer gets the KV cache buffers from the pool's get_state and
+    # set_state. TpuSplitMLATokenToKVPool does not implement them for its own
+    # buffers, so the first compile would fail.
+    # TODO(sglang-torchtpu#1072): implement them and run DSA with the direct
+    # tracer.
+    if cfg.tpu_compile_tracer != "dynamo":
+        raise ValueError(
+            "DSA on TPU needs --tpu-compile-tracer dynamo, got "
+            f"{cfg.tpu_compile_tracer!r}."
+        )
+
+
+def _register_attention_backends() -> None:
+    """Add the attention backends that only this package knows to the registry."""
+    from sglang.srt.layers.attention.attention_registry import (
+        register_attention_backend,
+        register_draft_attention_backend,
+    )
+    from sglang_tpu.attention_pallas_rpa_base import (
+        TpuPallasRpaMultiStepDraftBackend,
+    )
+
+    @register_draft_attention_backend("pallas_tpu_rpa_v3")
+    def create_pallas_tpu_rpa_v3_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasRpaV3AttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_rpa_batched")
+    def create_pallas_tpu_rpa_batched_draft_backend(
+        runner, topk, speculative_num_steps
+    ):
+        from sglang_tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedAttnBackend,
+        )
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasRpaBatchedAttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_mla")
+    def create_pallas_tpu_mla_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasMlaAttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_mla_sparse")
+    def create_pallas_tpu_mla_sparse_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_mla_sparse import (
+            TpuPallasSparseMlaAttnBackend,
+        )
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasSparseMlaAttnBackend
+        )
+
+    @register_attention_backend("pallas_tpu_mla_sparse")
+    def create_pallas_tpu_mla_sparse_backend(runner):
+        from sglang_tpu.attention_pallas_mla_sparse import (
+            TpuPallasSparseMlaAttnBackend,
+        )
+
+        return TpuPallasSparseMlaAttnBackend(runner)
+
+    @register_attention_backend("dsv4")
+    def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.dsv4 import DSV4TPUAttnBackend
+
+        return DSV4TPUAttnBackend(runner)
+
+
+def _register_models() -> None:
+    """Add the model implementations that only this package provides to the registry."""
+    from sglang.srt.models.registry import ModelRegistry
+
+    # A module that fails to import is logged and skipped, so it can't take the
+    # other models down with it; an arch core already serves raises.
+    ModelRegistry.register("sglang_tpu.models")
 
 
 def _resolve_num_hidden_layers(server_args) -> int:
@@ -504,9 +657,9 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU: the DCP attention runs "
             "plain decode and extend batches only."
         )
-    if cfg.enable_dp_attention:
+    if cfg.attn_dp_size > 1:
         raise ValueError(
-            "--enable-dp-attention is not supported with "
+            "DP attention (--attn-dp-size > 1) is not supported with "
             "--decode-context-parallel-size > 1 on TPU."
         )
     if cfg.attn_cp_size > 1:
@@ -595,6 +748,13 @@ def _validate_decode_context_parallel(server_args) -> None:
         )
 
 
+def _experimental_spec_enabled() -> bool:
+    # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+    from sglang_tpu.experimental import experimental_spec_enabled
+
+    return experimental_spec_enabled()
+
+
 class TpuSRTPlatform(SRTPlatform):
     """SGLang SRT platform for Google Cloud TPUs via torch_tpu."""
 
@@ -603,6 +763,16 @@ class TpuSRTPlatform(SRTPlatform):
     device_type: str = "tpu"
 
     supported_quantization: list[str] = []
+
+    def get_traced_rank(
+        self, rank: int, *, group_size: int | None = None
+    ) -> torch.Tensor | None:
+        return traced_rank(rank, group_size=group_size)
+
+    def slice_tensor_for_rank(
+        self, tensor: torch.Tensor, dim: int, parts: int, rank: int
+    ) -> torch.Tensor:
+        return rank_slice(tensor, dim, parts, rank)
 
     # ------------------------------------------------------------------
     # Configuration lifecycle
@@ -620,9 +790,19 @@ class TpuSRTPlatform(SRTPlatform):
             Phase,
             with_phase,
         )
+        from sglang_tpu.kimi_k3 import check_static_fp8_spec_batch, static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
 
+        # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
+        # weights have loaded (its binder runs post-load).
+        parts = static_fp8_parts()
         cfg = resolving_view(server_args)
+        if "latent_up" in parts:
+            check_static_fp8_spec_batch(
+                parts,
+                speculative_algorithm=cfg.speculative_algorithm,
+                max_running_requests=cfg.max_running_requests,
+            )
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
         _validate_raiden_optimistic_prefill(
@@ -630,6 +810,11 @@ class TpuSRTPlatform(SRTPlatform):
             transfer_backend=cfg.disaggregation_transfer_backend,
             optimistic_prefill_attempts=cfg.optimistic_prefill_attempts,
         )
+        _validate_pd_queue_limit(
+            disaggregation_mode=cfg.disaggregation_mode,
+            max_queued_requests=cfg.max_queued_requests,
+        )
+        _validate_kv_checksum(cfg.disaggregation_enable_kv_checksum)
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray
@@ -661,6 +846,8 @@ class TpuSRTPlatform(SRTPlatform):
 
         _validate_prefill_context_parallel(server_args)
         apply_prefill_cp_sparse_core_override(attn_cp_size=cfg.attn_cp_size)
+        # Before the default backend below, so the error names what was passed.
+        _validate_dsa(server_args)
 
         # Decode context parallelism runs on one backend only, so an unset
         # backend resolves to it instead of the platform default.
@@ -719,13 +906,13 @@ class TpuSRTPlatform(SRTPlatform):
                 server_args, "tpu.apply_server_args_defaults", mem_fraction_static=0.40
             )
 
-        # raiden's load-back keeps the reloaded prefix's slot indices on CPU
-        # (TpuRaidenHiCacheController.load), so req_to_token must stay
+        # A TPU DMA backend's load-back keeps the reloaded prefix's slot indices
+        # on CPU (TpuDMAHiCacheController.load), so req_to_token must stay
         # host-resident: a device-resident req_to_token would put the other
         # nodes' prefix indices on device and mix devices in the prefix cat. Pin
-        # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 for raiden.
-        if cfg.hicache_io_backend == "raiden":
-            _pin_req_to_token_on_host("the raiden KV-offload backend")
+        # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 for every engine.
+        if is_tpu_dma_hicache_backend(cfg.hicache_io_backend):
+            _pin_req_to_token_on_host(f"--hicache-io-backend {cfg.hicache_io_backend}")
 
         # There is no CUDA coredump on TPU: on a crash the handler would trigger
         # a no-op dump, then sleep SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS
@@ -737,20 +924,23 @@ class TpuSRTPlatform(SRTPlatform):
         # axis. SGLang's global page_size=1 default is valid for token-granular
         # GPU kernels, but is inefficient here: it makes page_indices
         # token-granular and turns KV fetches into many tiny DMAs.
-        # Builtin TPU speculative decoding currently supports EAGLE3 only.
+        # Builtin TPU speculative decoding supports linear EAGLE/MTP and DFLASH.
         # Registered algorithms own their validation and backend integration.
         spec_algo = cfg.speculative_algorithm
         if spec_algo is not None:
-            if spec_algo == "EAGLE3":
+            if spec_algo in ("EAGLE", "EAGLE3", "NEXTN"):
                 if cfg.speculative_use_rejection_sampling:
                     raise NotImplementedError(
-                        "EAGLE3 rejection sampling is not supported on TPU yet."
+                        "EAGLE-family rejection sampling is not supported on TPU yet."
                     )
                 if (cfg.speculative_eagle_topk or 1) > 1:
                     raise NotImplementedError(
-                        "EAGLE3 topk > 1 is not supported on TPU yet."
+                        "EAGLE-family topk > 1 is not supported on TPU yet."
                     )
             elif spec_algo == "DFLASH":
+                pass
+            elif spec_algo == "DSPARK" and _experimental_spec_enabled():
+                # Served by sglang_tpu.experimental.TpuBlockSpecWorker.
                 pass
             else:
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -761,14 +951,13 @@ class TpuSRTPlatform(SRTPlatform):
                 if spec_algo.upper() in SpeculativeAlgorithm.__members__:
                     raise NotImplementedError(
                         f"Speculative algorithm {spec_algo!r} is not supported on TPU "
-                        "yet (only EAGLE3 and DFLASH among builtin algorithms)."
+                        "yet (only EAGLE, EAGLE3, NEXTN and DFLASH among builtin algorithms)."
                     )
 
-        # Attention DP is declared by width (--attn-dp-size); the deprecated
-        # --dp-size N --enable-dp-attention spelling may not have resolved yet here.
+        # Platform defaults run after handle_deprecated_dp_attention, so the
+        # deprecated --dp-size N --enable-dp-attention spelling has already
+        # resolved to attn_dp_size=N here.
         attn_dp_size = cfg.attn_dp_size
-        if attn_dp_size == 1 and cfg.enable_dp_attention:
-            attn_dp_size = cfg.dp_size
         if attn_dp_size > 1:
             attn_tp_size = cfg.tp_size // attn_dp_size
             if attn_tp_size > 1 and not cfg.enable_dp_lm_head:
@@ -776,6 +965,18 @@ class TpuSRTPlatform(SRTPlatform):
                     f"When attention TP > 1 under DP attention on TPU (attn_tp_size={attn_tp_size} "
                     f"from tp_size={cfg.tp_size} and attn_dp_size={attn_dp_size}), "
                     "--enable-dp-lm-head must be enabled."
+                )
+            if (
+                not cfg.enable_dp_lm_head
+                and spec_algo in ("EAGLE", "NEXTN", "DFLASH", "DSPARK")
+                and _experimental_spec_enabled()
+            ):
+                # These drafts share the target lm_head but run in the attention-TP
+                # group; a head sharded over the full TP group would draft from one shard.
+                raise ValueError(
+                    f"The experimental TPU spec worker serves {spec_algo} under DP "
+                    "attention only with --enable-dp-lm-head, which shards the shared "
+                    "lm_head over the draft's attention-TP group."
                 )
 
         _apply_page_size_default(server_args)
@@ -837,6 +1038,63 @@ class TpuSRTPlatform(SRTPlatform):
 
         return _mha_kv_pool_cls(get_exec().kernel.attention_backend)
 
+    def get_mha_kv_bytes_per_token(
+        self,
+        *,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        kv_cache_dtype: torch.dtype,
+    ) -> Optional[int]:
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        pool_cls = self.get_mha_kv_pool_cls()
+        if not issubclass(pool_cls, TpuFusedMHATokenToKVPool):
+            return None
+        return pool_cls.kv_bytes_per_token_per_layer(
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            store_dtype=kv_cache_dtype,
+        )
+
+    supports_mamba_extra_buffer = True
+
+    def supports_mamba_prefix_cache(self, model_config) -> bool:
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+        # KDA shares GDN metadata setup, but does not pass snapshot tracking
+        # to its kernel yet. Only the GDN backend writes reusable checkpoints.
+        return hybrid_gdn_config(model_config) is not None
+
+    def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
+        # Mixed-batch merging drops the tracking plan while requests retain
+        # checkpoint depths, so the radix tree could cache unwritten states.
+        if view.enable_mixed_chunk and not view.disable_radix_cache:
+            raise ValueError(
+                "TPU GDN prefix caching does not support --enable-mixed-chunk. "
+                "Remove --enable-mixed-chunk or use --disable-radix-cache."
+            )
+        # Lazy slot allocation/release has not been validated with TPU snapshots.
+        if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
+            raise ValueError(
+                "extra_buffer_lazy is not supported for TPU GDN prefix caching. "
+                "Use --mamba-radix-cache-strategy extra_buffer."
+            )
+        # Host and int8 stores expect stacked GPU-layout states; TPU owns
+        # independent kernel-layout tensors per layer.
+        for flag in ("enable_hierarchical_cache", "enable_int8_mamba_checkpoint"):
+            if getattr(view, flag):
+                raise ValueError(
+                    f"--{flag.replace('_', '-')} is not supported for TPU GDN prefix caching. "
+                    "Use device-resident, uncompressed Mamba states."
+                )
+        if hf_config is not None:
+            text_config = getattr(hf_config, "text_config", hf_config)
+            assert getattr(text_config, "mamba_chunk_size", 64) == 64, (
+                "TPU GDN prefix caching requires mamba_chunk_size=64."
+            )
+
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.
@@ -844,26 +1102,32 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuMambaPool
 
-    def get_mha_kv_pool_host_cls(self, device_pool) -> type:
-        from sglang.srt.mem_cache.memory_pool_host import (
-            TpuFusedMHATokenToKVPoolHost,
+    def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
+        from sglang.srt.mem_cache.pool_host.base import (
+            host_memory_budget_bytes,
+            host_memory_budget_scope,
         )
+        from sglang.srt.runtime_context import get_memory
 
-        # Upstream relocated MHATokenToKVPoolHost from mem_cache.memory_pool_host
-        # into the mem_cache.pool_host package; TpuFusedMHATokenToKVPoolHost is the
-        # fork's own class and still lives in memory_pool_host.
+        if not is_tpu_dma_hicache_backend(get_memory().hicache_io_backend):
+            return super().get_hicache_explicit_size_context()
+        # Full, SWA, and draft pools must fit within one combined RAM budget.
+        return host_memory_budget_scope(host_memory_budget_bytes())
+
+    def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
         from sglang.srt.runtime_context import get_memory
         from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.kv_pool_host import (
+            TpuFusedMHATokenToKVPoolHost,
+            tpu_dma_host_kv_pool_cls,
+        )
 
-        # raiden offloads through tpu-sync's DMA-pinned host pool instead of the
+        # TPU DMA backends offload through their own host memory instead of the
         # torch-copy fused host pool; native (torch_tpu) keeps the fused pool.
-        if get_memory().hicache_io_backend == "raiden":
-            from sglang_tpu.kv_pool_host import (
-                TpuRaidenHostKVCache,
-            )
-
-            return TpuRaidenHostKVCache
+        io_backend = get_memory().hicache_io_backend
+        if is_tpu_dma_hicache_backend(io_backend):
+            return tpu_dma_host_kv_pool_cls(io_backend)
 
         if isinstance(device_pool, TpuFusedMHATokenToKVPool):
             return TpuFusedMHATokenToKVPoolHost
@@ -886,8 +1150,10 @@ class TpuSRTPlatform(SRTPlatform):
 
         return MLATokenToKVPool
 
-    def get_nsa_kv_pool_cls(self) -> type:
-        raise NotImplementedError("NSA is not supported on TPU.")
+    def get_dsa_kv_pool_cls(self) -> type:
+        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
+
+        return TpuSplitMLATokenToKVPool
 
     def get_zigzag_cp_strategy_cls(self) -> type:
         from sglang_tpu.cp_strategy import TpuZigzagCPStrategy
@@ -908,6 +1174,39 @@ class TpuSRTPlatform(SRTPlatform):
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 
+    def get_batch_input_device(self, batch) -> str | None:
+        """Keep eligible prefill inputs on CPU until backend padding."""
+        from sglang.srt.layers.cp.base import get_cp_strategy
+        from sglang.srt.utils.common import print_warning_once
+        from sglang_tpu.allocator_tpu import host_return_allocators
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.host_padding import _can_stage_forward_metadata
+
+        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get():
+            return None
+        # TBO, hisparse and beam search have no TPU path, so they need no opt-out.
+        allocator = batch.token_to_kv_pool_allocator
+        checks = (
+            ("forward metadata is not staged", _can_stage_forward_metadata(batch)),
+            ("context parallelism is on", get_cp_strategy() is None),
+            ("the allocator returns device indices", host_return_allocators(allocator)),
+            # Page size 1 uses alloc(), which has no host-return contract.
+            ("page size is 1", allocator.page_size > 1),
+            (
+                "req_to_token is on the device",
+                batch.req_to_token_pool.req_to_token.device.type == "cpu",
+            ),
+        )
+        for reason, ok in checks:
+            if not ok:
+                print_warning_once(
+                    "SGLANG_TPU_HOST_PADDING is set, but prefill inputs upload at "
+                    f"the live length because {reason}. This may compile a program "
+                    "per prompt length."
+                )
+                return None
+        return "cpu"
+
     def supports_torch_compile(self) -> bool:
         return True
 
@@ -920,6 +1219,14 @@ class TpuSRTPlatform(SRTPlatform):
 
     def supports_fp8(self) -> bool:
         return False
+
+    def supports_speculative_dp_attention(self, algorithm: str) -> bool:
+        # Every experimental TpuSpecWorker serves DP attention; core's DFlash worker does not.
+        # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.experimental import is_experimental_spec
+
+        return is_experimental_spec(SpeculativeAlgorithm.from_string(algorithm))
 
     def is_pin_memory_available(self, device=None) -> bool:
         return False
@@ -939,6 +1246,11 @@ class TpuSRTPlatform(SRTPlatform):
         return True
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
+        return True
+
+    def keeps_swa_index_mapping_on_host(self) -> bool:
+        # SWATokenToKVPoolAllocator keeps the mapping on the host, and the
+        # host-resident req_to_token table hands its segment frees host indices.
         return True
 
     def supports_overlap_streams(self) -> bool:
@@ -964,12 +1276,6 @@ class TpuSRTPlatform(SRTPlatform):
                 "Initialize it from the scheduler worker bootstrap."
             )
 
-        from sglang_tpu.compile_cache import (
-            add_pallas_kernel_sources_to_compile_cache_key,
-        )
-
-        add_pallas_kernel_sources_to_compile_cache_key()
-
         # Keep c10d_functional collectives inside the compiled graph. torch_tpu
         # defaults to materializing collective tensors by forcing graph breaks, which
         # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
@@ -977,6 +1283,9 @@ class TpuSRTPlatform(SRTPlatform):
         os.environ.setdefault(
             "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
         )
+        # Allow legacy torch.tpu device APIs (e.g. set_device, is_available,
+        # synchronize) called by SGLang's generic runtime bootstrap.
+        os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
 
         # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
         # read by libtpu at init, so it MUST be set before `import torch_tpu`.
@@ -1002,18 +1311,41 @@ class TpuSRTPlatform(SRTPlatform):
         # topology discovery is therefore confined to the worker.
         _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
 
+        from sglang_tpu.compile_cache import (
+            add_tpu_kernel_inputs_to_compile_cache_key,
+        )
+
+        # After _prepare_tpu_env: the key must see the final LIBTPU_INIT_ARGS.
+        add_tpu_kernel_inputs_to_compile_cache_key()
+
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        # Resolve after worker setup, before Dynamo can trace either helper.
+        rank_slice._load()
+        traced_rank._load()
+        _register_attention_backends()
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
+            from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
+
+            register_fp8_linear_small_m_op()
+        # Set before registering: importing the model registry imports model_runner,
+        # which calls init_backend again on the OOT path.
         self._backend_initialized = True
+        _register_models()
 
     def on_warmup_complete(self) -> None:
         """Freeze torch.compile so serving-time recompiles raise."""
         from sglang.srt.runtime_context import get_exec, get_spec
         from sglang_tpu.compilation.recompilation_checker import (
+            arm_recompilation_checker,
             maybe_enable_site_tracing,
         )
 
+        if get_exec().graph.enable_torch_compile:
+            arm_recompilation_checker(reset_counters=False, overwrite_baseline=False)
         # Dispatch modes are thread-local; this runs on the scheduler thread.
         maybe_enable_site_tracing()
         if not get_exec().graph.enable_torch_compile:
@@ -1034,13 +1366,37 @@ class TpuSRTPlatform(SRTPlatform):
             "set_stance('fail_on_recompile')."
         )
 
+    def get_compilation_cache_misses(self) -> Optional[int]:
+        """Return tier-1 misses, including compiles and persistent-cache loads."""
+        get_cache_misses = getattr(
+            getattr(torch, "tpu", None), "_get_cache_misses", None
+        )
+        return None if get_cache_misses is None else int(get_cache_misses())
+
+    def get_recompilation_counters(self) -> dict[str, Any]:
+        from sglang_tpu.compilation.recompilation_checker import (
+            get_recompilation_counters,
+        )
+
+        # Always flush when /get_internal_state is queried so post-forward eager
+        # ops (e.g. TpuSampler, FutureMap) after the final forward step are captured.
+        return get_recompilation_counters(flush=True)
+
     def prepare_model_parallel_groups(self) -> None:
         from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.pp_stage_chips import (
+            validate_chips_for_pp,
+        )
         from sglang_tpu.pp_stage_groups import (
             make_stage_groups_standalone,
         )
 
         make_stage_groups_standalone(get_parallel())
+        validate_chips_for_pp(get_parallel())
+        # Before the first collective and before torch.compile traces the model.
+        from sglang_tpu.twolevel_allreduce import register_from_parallel_state
+
+        register_from_parallel_state()
 
     # ------------------------------------------------------------------
     # MultiPlatformOp integration

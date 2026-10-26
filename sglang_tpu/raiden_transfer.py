@@ -19,6 +19,7 @@ import time
 from typing import TYPE_CHECKING, List
 
 from sglang.srt.environ import envs
+from sglang_tpu.tpu_dma_hicache import NOOP_EVENT
 
 if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -41,6 +42,11 @@ class RaidenFutureEvent:
 
     def __init__(self, future):
         self._future = future
+        # A poll past this raises like a blocking wait: the copy's pages can be
+        # neither reused nor released while it may still land.
+        self._poll_deadline = (
+            time.monotonic() + envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.get()
+        )
 
     def _raise_if_failed(self) -> None:
         """Surface a ready DMA's error; ``ok()`` is a non-blocking probe."""
@@ -52,6 +58,11 @@ class RaidenFutureEvent:
         if self._future is None:
             return True
         if not self._future.is_ready():
+            if time.monotonic() > self._poll_deadline:
+                raise TimeoutError(
+                    "raiden DMA still pending "
+                    f"{envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.get()}s after issue"
+                )
             return False
         self._raise_if_failed()
         return True
@@ -73,36 +84,6 @@ class RaidenFutureEvent:
                 raise TimeoutError(f"raiden DMA did not complete within {timeout_s}s")
             time.sleep(self._POLL_INTERVAL_S)
         self._raise_if_failed()
-
-    def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
-        return None
-
-    def wait(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
-        return None
-
-
-# A no-op event used for the ``start_event`` slot of ``HiCacheAck`` (HiCache
-# only ever queries/synchronizes the ``finish_event``).
-NOOP_EVENT = RaidenFutureEvent(None)
-
-
-class CombinedFutureEvent:
-    """A single event over several ``RaidenFutureEvent``-like events.
-
-    Presents one completion surface for an operation that fans out into
-    multiple raiden DMAs (e.g. the target and draft KV pools transferred by
-    one HiCache write-back): ready only when every underlying event is ready.
-    """
-
-    def __init__(self, events):
-        self._events = list(events)
-
-    def query(self) -> bool:
-        return all(event.query() for event in self._events)
-
-    def synchronize(self) -> None:
-        for event in self._events:
-            event.synchronize()
 
     def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
         return None

@@ -20,6 +20,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
 )
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel
 from sglang.srt.server_args import compute_world_size
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -95,6 +96,9 @@ class SchedulerInternalStateController:
         # Dynamo counters the TPU compile tests read back: how many frames and
         # AOT graphs the server traced, and what a compile bundle holds.
         server_args = self.scheduler.server_args
+        compilation_cache_misses = current_platform.get_compilation_cache_misses()
+        if compilation_cache_misses is not None:
+            state["compilation_cache_misses"] = compilation_cache_misses
         if get_exec().graph.enable_torch_compile:
             counters = torch._dynamo.utils.counters
             state["torch_compile_dynamo_frames"] = counters["frames"]["total"]
@@ -111,6 +115,8 @@ class SchedulerInternalStateController:
             state["torch_compile_bundle_aot_autograd_graphs"] = counters[
                 "aot_autograd"
             ]["total"]
+        if hasattr(current_platform, "get_recompilation_counters"):
+            state.update(current_platform.get_recompilation_counters())
 
     def _add_disaggregation(self, state: Dict[str, Any]) -> None:
         # PD role switch: report this instance's role and the decode CUDA graph

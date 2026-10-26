@@ -14,14 +14,30 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
+from sglang.srt.arg_groups.validation_hook import (
+    check_pipeline_parallel_compat as core_check_pipeline_parallel_compat,
+)
 from sglang.srt.distributed import parallel_state
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
+from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+    SpecAuxHiddenStateConfig,
+)
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import pp_stage_groups
+from sglang_tpu import pp_stage_chips, pp_stage_groups
+from sglang_tpu.envs import envs
+from sglang_tpu.hooks.pipeline_parallel import (
+    check_pipeline_parallel_compat,
+    skip_spec_op_precompile_without_draft,
+)
+from sglang_tpu.pp_scheduler import _check_aux_capture_relay
+from sglang_tpu.pp_wave import num_relayed_aux_slots
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 
 def _args(**overrides):
+    # Platform defaults run after handle_deprecated_dp_attention, so they only
+    # ever see attn_dp_size=N; the deprecated spelling is a state they never get.
+    assert not overrides.get("enable_dp_attention"), "pass attn_dp_size=N"
     defaults = dict(
         dtype=None,
         attention_backend=None,
@@ -35,6 +51,7 @@ def _args(**overrides):
         pp_size=1,
         dp_size=1,
         dcp_size=1,
+        ep_size=1,
         enable_dp_attention=False,
         attn_dp_size=1,
         enable_dp_lm_head=False,
@@ -53,6 +70,7 @@ def _args(**overrides):
         optimistic_prefill_attempts=0,
         max_queued_requests=None,
         enable_priority_scheduling=False,
+        disaggregation_enable_kv_checksum=False,
         attn_cp_size=1,
         enable_prefill_cp=False,
         cp_strategy=None,
@@ -144,11 +162,22 @@ class TestPipelineParallelValidation(CustomTestCase):
         prepare_tpu_env = _apply(_args(tp_size=8))
         prepare_tpu_env.assert_called_once_with(8, setup_slicebuilder=True)
 
-    def test_rejects_tensor_parallel_stages(self):
-        with self.assertRaisesRegex(
-            NotImplementedError, r"--attn-cp-size equal to --tp-size"
+    def test_accepts_tensor_parallel_pair_stages(self):
+        prepare_tpu_env = _apply(_args(pp_size=8, tp_size=2, enable_torch_compile=True))
+        prepare_tpu_env.assert_called_once_with(16, setup_slicebuilder=True)
+
+    def test_rejects_tensor_parallel_stages_other_than_a_plain_pair(self):
+        """Only two-device stages of plain tensor parallelism were validated."""
+        for overrides in (
+            dict(tp_size=4),
+            dict(tp_size=2, attn_dp_size=2),
+            dict(tp_size=2, ep_size=2),
         ):
-            _apply(_args(pp_size=2, tp_size=2))
+            with self.subTest(**overrides):
+                with self.assertRaisesRegex(
+                    NotImplementedError, r"tensor-parallel pair"
+                ):
+                    _apply(_args(pp_size=2, enable_torch_compile=True, **overrides))
 
     def test_rejects_stages_wider_than_their_context_parallel_group(self):
         with self.assertRaisesRegex(
@@ -181,11 +210,21 @@ class TestPipelineParallelValidation(CustomTestCase):
         _apply(args)
         self.assertEqual(resolution_result(args, "kv_cache_dtype"), "bfloat16")
 
-    def test_rejects_speculative_decoding(self):
+    def test_rejects_speculative_decoding_outside_prefill_disaggregation(self):
         with self.assertRaisesRegex(
             NotImplementedError, r"Speculative decoding.*pipeline parallelism"
         ):
             _apply(_args(pp_size=2, speculative_algorithm="EAGLE3"))
+
+    def test_accepts_speculative_decoding_on_a_prefill_node(self):
+        _apply(
+            _args(
+                pp_size=2,
+                speculative_algorithm="EAGLE3",
+                disaggregation_mode="prefill",
+                enable_torch_compile=True,
+            )
+        )
 
     def test_rejects_dynamic_chunking(self):
         with self.assertRaisesRegex(
@@ -202,13 +241,120 @@ class TestPipelineParallelValidation(CustomTestCase):
     def test_rejection_happens_before_the_slice_env_is_prepared(self):
         with patch("sglang_tpu.patches._prepare_tpu_env") as prepare_tpu_env:
             with self.assertRaises(NotImplementedError):
-                TpuSRTPlatform().apply_server_args_defaults(_args(pp_size=2, tp_size=2))
+                TpuSRTPlatform().apply_server_args_defaults(
+                    _cp_stage_args(tp_size=4, attn_cp_size=2)
+                )
         prepare_tpu_env.assert_not_called()
 
     def test_single_stage_keeps_every_flag(self):
         args = _args(pp_size=1, tp_size=8, enable_dynamic_chunking=True)
         _apply(args)
         self.assertTrue(args.enable_dynamic_chunking)
+
+
+def _compat_cfg(**overrides):
+    defaults = dict(
+        speculative_algorithm="EAGLE3",
+        disable_overlap_schedule=True,
+        enable_multi_layer_eagle=False,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+class TestEagle3PipelineParallelCompat(CustomTestCase):
+    def test_eagle3_runs_the_core_check_as_eagle(self):
+        original = Mock()
+        check_pipeline_parallel_compat(original, _compat_cfg())
+        original.assert_called_once()
+        (cfg,) = original.call_args.args
+        self.assertEqual(cfg.speculative_algorithm, "EAGLE")
+        self.assertTrue(cfg.disable_overlap_schedule)
+
+    def test_other_algorithms_run_the_core_check(self):
+        for algorithm in (None, "EAGLE", "DSPARK"):
+            original = Mock()
+            cfg = _compat_cfg(speculative_algorithm=algorithm)
+            check_pipeline_parallel_compat(original, cfg)
+            original.assert_called_once_with(cfg)
+
+    def test_eagle3_rejects_overlap_schedule(self):
+        with self.assertRaisesRegex(AssertionError, "overlap schedule"):
+            check_pipeline_parallel_compat(
+                core_check_pipeline_parallel_compat,
+                _compat_cfg(disable_overlap_schedule=False),
+            )
+
+    def test_eagle3_rejects_multi_layer_eagle(self):
+        with self.assertRaisesRegex(AssertionError, "non-multi-layer"):
+            check_pipeline_parallel_compat(
+                core_check_pipeline_parallel_compat,
+                _compat_cfg(enable_multi_layer_eagle=True),
+            )
+
+    def test_experimental_dflash_is_admitted_on_a_prefill_node_only(self):
+        """The experimental worker seeds DFlash draft KV on a PP prefill; nothing else runs it."""
+        cfg = dict(
+            speculative_algorithm="DFLASH",
+            min_free_slots_delay=None,
+            disaggregation_mode="prefill",
+        )
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            check_pipeline_parallel_compat(
+                core_check_pipeline_parallel_compat, _compat_cfg(**cfg)
+            )
+            with self.assertRaisesRegex(AssertionError, "disaggregation-mode=prefill"):
+                check_pipeline_parallel_compat(
+                    core_check_pipeline_parallel_compat,
+                    _compat_cfg(**{**cfg, "disaggregation_mode": "null"}),
+                )
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            # Core's DFlash worker builds its draft on every stage.
+            with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
+                check_pipeline_parallel_compat(
+                    core_check_pipeline_parallel_compat, _compat_cfg(**cfg)
+                )
+
+    def test_stage_without_draft_skips_spec_op_precompile(self):
+        original = Mock()
+        scheduler = SimpleNamespace(draft_worker=SimpleNamespace(draft_worker=None))
+        skip_spec_op_precompile_without_draft(original, scheduler)
+        original.assert_not_called()
+
+    def test_stage_with_draft_precompiles_spec_ops(self):
+        original = Mock()
+        scheduler = SimpleNamespace(draft_worker=SimpleNamespace(draft_worker=object()))
+        skip_spec_op_precompile_without_draft(original, scheduler)
+        original.assert_called_once_with(scheduler)
+
+    def test_model_without_relay_rejects_captures_before_the_last_stage(self):
+        model = SimpleNamespace(
+            model=SimpleNamespace(
+                layers_to_capture=[2, 18], start_layer=10, end_layer=20
+            )
+        )
+        with self.assertRaisesRegex(NotImplementedError, r"layers \[2\]"):
+            _check_aux_capture_relay(model)
+
+    def test_model_without_relay_hands_on_no_aux_slots(self):
+        config = SimpleNamespace(
+            eagle_use_aux_hidden_state=True, eagle_aux_hidden_state_layer_ids=[2, 18]
+        )
+        self.assertEqual(num_relayed_aux_slots(config, SimpleNamespace()), 0)
+        relaying = SimpleNamespace(relays_pp_aux_hidden_states=True)
+        self.assertEqual(num_relayed_aux_slots(config, relaying), 2)
+
+    def test_dflash_captures_size_the_aux_slots(self):
+        """The wave width must match the DFlash capture count the stages relay."""
+        relaying = SimpleNamespace(relays_pp_aux_hidden_states=True)
+        config = SpecAuxHiddenStateConfig(
+            dflash_use_aux_hidden_state=True, dflash_target_layer_ids=[1, 9, 17, 25, 33]
+        )
+        self.assertEqual(num_relayed_aux_slots(config, relaying), 5)
+        with self.assertRaisesRegex(NotImplementedError, "dflash_target_layer_ids"):
+            num_relayed_aux_slots(
+                SpecAuxHiddenStateConfig(dflash_use_aux_hidden_state=True), relaying
+            )
 
 
 def _group(*ranks):
@@ -271,6 +417,41 @@ class TestStandaloneStageGroups(CustomTestCase):
                 RuntimeError, r"torch_tpu with standalone process subgroups"
             ):
                 pp_stage_groups.make_stage_groups_standalone(parallel)
+
+
+def _on(chip, core):
+    return pp_stage_chips.CoreLocation(slice_index=0, coords=chip, core_on_chip=core)
+
+
+class TestPipelineStageChips(CustomTestCase):
+    def test_a_pair_must_hold_every_core_of_its_chip(self):
+        """A pair split over two-device chips all-reduces over ICI and shares
+        each chip with another stage, also when it uses core 0 of both."""
+        chip_a, chip_b = (0, 0, 0), (1, 0, 0)
+        violations = pp_stage_chips._partial_chip_problems
+        self.assertEqual(
+            violations([_on(chip_a, 0), _on(chip_a, 1)], devices_per_chip=2), []
+        )
+        split = [_on(chip_a, 0), _on(chip_b, 0)]
+        self.assertEqual(len(violations(split, devices_per_chip=2)), 2)
+        self.assertEqual(violations(split, devices_per_chip=1), [])
+
+    def test_an_unrecognized_tpu_fails_at_startup(self):
+        # Context-parallel stages (attn_cp_size 2) are checked like TP pairs.
+        for attn_cp_size in (1, 2):
+            parallel = SimpleNamespace(
+                pp_size=4,
+                tp_size=2,
+                attn_cp_size=attn_cp_size,
+                pp_rank=1,
+                tp_group=_group(2, 3),
+            )
+            with (
+                self.subTest(attn_cp_size=attn_cp_size),
+                patch.object(pp_stage_chips, "_devices_per_chip", return_value=None),
+                self.assertRaisesRegex(RuntimeError, "does not recognize"),
+            ):
+                pp_stage_chips.validate_chips_for_pp(parallel)
 
 
 if __name__ == "__main__":

@@ -20,13 +20,6 @@ if TYPE_CHECKING:
 class TpuKDAAttnBackend(TpuGDNAttnBackend):
     """TPU KDA linear-attention backend backed by the fused Pallas kernel."""
 
-    def init_forward_metadata(self, forward_batch):
-        if forward_batch.forward_mode.is_target_verify():
-            raise NotImplementedError(
-                "TpuKDAAttnBackend does not support speculative target verify"
-            )
-        super().init_forward_metadata(forward_batch)
-
     def _run(
         self,
         layer: "RadixLinearAttention",
@@ -37,31 +30,46 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         num_tokens = mixed_qkv.shape[0]
         n_v, d_k, d_v = layer.num_v_heads, layer.head_k_dim, layer.head_v_dim
+        # Kimi-Linear / Bailing bind [dim, K]; Kimi-K3 binds its depthwise
+        # [dim, 1, K] parameter itself.
+        conv_weight = layer.conv_weights
+        if conv_weight.ndim == 2:
+            conv_weight = conv_weight.unsqueeze(1)
         # The kernel takes the raw forget gate [T, n_v * d_k] and raw beta [T, n_v];
-        # the model hands them over with leading batch / per-head axes.
+        # the model hands them over with leading batch / per-head axes. Fused
+        # projections pass split views, and the op reads raw buffers, so make
+        # every input dense.
+        state_rows, read_offsets = self._state_rows()
         out = self._op(
-            mixed_qkv,
-            b.reshape(num_tokens, n_v),
-            a.reshape(num_tokens, n_v * d_k),
+            mixed_qkv.contiguous(),
+            b.reshape(num_tokens, n_v).contiguous(),
+            a.reshape(num_tokens, n_v * d_k).contiguous(),
             layer_cache.conv[0],
             layer_cache.temporal,
-            # [dim, K] -> the kernel's depthwise [dim, 1, K].
-            layer.conv_weights.unsqueeze(1),
+            conv_weight,
             layer.bias,
             layer.A_log,
             # Per-channel under KDA; Mosaic rejects the flat [n_v * d_k] form.
             layer.dt_bias.reshape(n_v, d_k),
             self._query_start_loc,
-            self._state_indices,
+            state_rows,
             self._distribution,
             self._seq_lens,
             layer.num_k_heads,
             n_v,
             d_k,
             d_v,
-            layer.conv_weights.shape[-1],
+            conv_weight.shape[-1],
             True,
             layer.lower_bound,
+            batched_only=self._is_decode,
+            prefill_only=not self._is_decode,
+            # Kimi-K3 passes its fused [q, k, v, g] projection as mixed_qkv.
+            fused_qkvg=getattr(layer, "fused_qkvg", False),
+            # Kimi-K3 packs conv / dt_bias / A_log into one f32 operand post-load.
+            packed_weights=getattr(layer, "packed_kernel_weights", None),
+            read_offsets=read_offsets,
+            num_spec_tokens=self._num_spec_tokens,
         )
         # Keep the batch axis: the model squeezes dim 0 after o_norm, which would
         # eat the token axis of a one-token decode.

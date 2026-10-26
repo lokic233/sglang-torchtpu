@@ -14,23 +14,19 @@ import errno
 import secrets
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVSender
+from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
 from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
 )
-from sglang_tpu.disaggregation.raiden.common import (
-    RESHARD_PUSH_PARALLELISM,
-    _tcp_endpoint,
-    logger,
-)
+from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -59,6 +55,22 @@ ROOM_SCOPED_SEND_ERRNOS = frozenset(
         errno.EINTR,  # a signal interrupted the send
     }
 )
+
+
+def _first_repeated_block(
+    accumulated: List[int], listed: Set[int], block_ids: List[int]
+) -> Optional[tuple[int, int, int]]:
+    """The first page of ``block_ids`` already in ``accumulated`` (whose pages
+    are ``listed``) or repeated within ``block_ids``, with both positions in
+    the room's send order."""
+    first_in_send = {}
+    for pos, block in enumerate(block_ids, len(accumulated)):
+        if block in listed:
+            return block, accumulated.index(block), pos
+        first = first_in_send.setdefault(block, pos)
+        if first != pos:
+            return block, first, pos
+    return None
 
 
 class RaidenSenderMixin:
@@ -138,6 +150,9 @@ class RaidenSenderMixin:
             )
             if status is None:
                 return
+            self._fail_room_unless_failed_locked(
+                room, "Aborted by decode-side abort notification."
+            )
             self.update_status(room, KVPoll.Failed)
         self._drop_room_state(room)
 
@@ -174,26 +189,93 @@ class RaidenSenderMixin:
                 exc,
             )
 
+    def notify_decode_room_failed(self, room: int) -> None:
+        """Tell every decode that has asked this rank for ``room`` that the
+        room failed here.
+
+        A decode that already sent its last request for the room has nothing
+        left to ask, so without this it learns of the failure only from its
+        own waiting timeout. Endpoints are read before the send, which runs
+        outside ``_state_lock``.
+        """
+        endpoints = []
+        if self._pipeline is not None:
+            with self._pipeline.lock:
+                endpoints.extend(self._pipeline.replies.get(room, ()))
+        with self._state_lock:
+            addr = self._prefill.decode_addr.get(room)
+            req = self._prefill.reshard_req.get(room)
+        if addr is not None:
+            endpoints.append(_tcp_endpoint(ip=addr[0], port=addr[1]))
+        if req is not None:
+            ip, port = req["reply_addr"]
+            endpoints.append(_tcp_endpoint(ip=ip, port=port))
+        if not endpoints:
+            return
+        with self.failure_lock:
+            reason = self.failure_records.get(room)
+        if reason is None:
+            reason = (
+                f"Prefill rank {self.attn_tp_rank} failed room {room}. "
+                "The prefill log has the cause"
+            )
+        for endpoint in dict.fromkeys(endpoints):
+            self._reply_room_failed(room=room, endpoint=endpoint, reason=reason)
+
     def append_send_blocks(
         self,
         room: int,
         block_ids: List[int],
         swa_block_ids: Optional[List[int]] = None,
+        state_block_ids: Optional[List[int]] = None,
     ) -> Optional[int]:
         """Records a chunk's pages and returns its start index in the request.
 
-        None means the decode aborted the room; the pages are not recorded and
-        the caller must not offer them.
+        None means the room failed; the pages are not recorded and the caller
+        must not offer them. A page recorded twice was freed and handed out
+        again under a pending transfer: the room fails, naming both positions.
         """
         with self._state_lock:
             if room in self._aborted:
                 return None
             accumulated = self._prefill.send_blocks.setdefault(room, [])
+            listed = self._prefill.send_block_set.setdefault(room, set())
             start = len(accumulated)
-            accumulated.extend(block_ids)
-            if swa_block_ids is not None:
-                self._prefill.send_swa_blocks[room] = list(swa_block_ids)
-        return start
+            repeated = _first_repeated_block(accumulated, listed, block_ids)
+            if repeated is None:
+                accumulated.extend(block_ids)
+                listed.update(block_ids)
+                if swa_block_ids is not None:
+                    self._prefill.send_swa_blocks[room] = list(swa_block_ids)
+                if state_block_ids is not None:
+                    self._prefill.send_state_rows[room] = list(state_block_ids)
+                return start
+            block, first, second = repeated
+            reason = (
+                f"KV page {block} is listed twice for one request, at send "
+                f"positions {first} and {second} (this send starts at {start}, "
+                f"{len(block_ids)} pages)"
+            )
+            self._mark_aborted_locked(room)
+            self._fail_room_locked(room, reason)
+            self.update_status(room, KVPoll.Failed)
+            decode_addr = self._prefill.decode_addr.get(room) or (
+                self._prefill.reshard_req.get(room, {}).get("reply_addr")
+            )
+        logger.error(
+            "RaidenKVManager rank%d room %s: %s, failing the room",
+            self.attn_tp_rank,
+            room,
+            reason,
+        )
+        if decode_addr is not None:
+            self._reply_room_failed(
+                room=room,
+                endpoint=_tcp_endpoint(ip=decode_addr[0], port=decode_addr[1]),
+                reason=reason,
+            )
+        self._drop_room_state(room)
+        return None
 
     def offer_chunk(
         self, room: int, start: int, block_ids: List[int], total_pages: int
@@ -336,6 +418,13 @@ class RaidenSenderMixin:
                     self.kv_args.aux_item_lens,
                     aux_index,
                 )
+            if (
+                self._read_state_meta is not None
+                and room in self._prefill.send_state_rows
+            ):
+                self._prefill.send_state_meta[room] = self._read_state_meta(
+                    self._prefill.send_state_rows[room]
+                )
             self._prefill.reshard_finalized.add(room)
             is_reshard = room in self._prefill.reshard_req
             self.update_status(room, KVPoll.Transferring)
@@ -347,6 +436,14 @@ class RaidenSenderMixin:
         else:
             self._maybe_reply(room)
         return True
+
+    def on_forward_launched(self, scheduler, mb_id: int, batch, result) -> None:
+        if self._pipeline is not None:
+            self._pipeline.final_chunks.launched(scheduler, mb_id, batch, result)
+
+    def on_outputs_copied(self, mb_id: int, next_token_ids) -> None:
+        if self._pipeline is not None:
+            self._pipeline.final_chunks.tokens_copied(mb_id, next_token_ids)
 
     def _decode_asked_locked(self, room: int) -> bool:
         """Whether the decode asked to pull the room, cleared it to push, or
@@ -464,7 +561,7 @@ class RaidenSenderMixin:
             with self._state_lock:
                 self._discard_sender_read_locked(room, req_id)
             return
-        logger.info(
+        logger.debug(
             "RaidenKVManager rank%d prefill registered read | room=%s "
             "req_id=%s uuid=%d pages=%d",
             self.attn_tp_rank,
@@ -485,9 +582,8 @@ class RaidenSenderMixin:
     def _settle_sender_reads_locked(self) -> None:
         settled = self._completed_send | self._native_failed
         for room, reads in list(self._send_reads.items()):
-            closing_done = str(room) in self._completed_send and (
-                self._swa_engine is None
-                or self._swa_req_id(room) in self._completed_send
+            closing_done = str(room) in self._completed_send and self._side_reads_done(
+                room, self._completed_send
             )
             if closing_done:
                 # The closing read covers every page the decode asked for
@@ -541,13 +637,19 @@ class RaidenSenderMixin:
                     self._swa_engine is not None
                     and room not in self._prefill.send_swa_blocks
                 )
+                or (
+                    self._state_engine is not None
+                    and room not in self._prefill.send_state_rows
+                )
                 or room not in self._prefill.decode_addr
             ):
                 return
             swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
+            state_rows = list(self._prefill.send_state_rows.get(room, []))
             blocks = list(self._prefill.send_blocks[room])
             addr = self._prefill.decode_addr[room]
             aux_blob = self._prefill.send_aux.get(room, b"")
+            state_meta = self._prefill.send_state_meta.get(room, b"")
             decode_pages = self._prefill.decode_pages[room]
             decode_swa_pages = self._prefill.decode_swa_pages[room]
             self._prefill.replied.add(room)
@@ -560,6 +662,16 @@ class RaidenSenderMixin:
         if not read_blocks:
             swa_read_blocks = []
         with self._announce_lock:
+            # GDN state cannot be rebuilt from cached KV, so even a full prefix
+            # hit moves it.
+            if self._state_engine is not None:
+                self._register_sender_read(
+                    room,
+                    self._state_engine,
+                    self._state_req_id(room),
+                    room,
+                    state_rows,
+                )
             if self._swa_engine is not None and swa_read_blocks:
                 self._register_sender_read(
                     room,
@@ -585,6 +697,9 @@ class RaidenSenderMixin:
                 swa_blocks=swa_blocks,
                 swa_endpoint=self.swa_raiden_endpoint or "",
                 aux_blob=aux_blob,
+                state_blocks=state_rows,
+                state_endpoint=self.state_raiden_endpoint or "",
+                state_meta=state_meta,
             ).to_frames()
             try:
                 self._send_multipart_locked(endpoint, payload)
@@ -610,6 +725,11 @@ class RaidenSenderMixin:
                 self._completed_send.add(self._swa_req_id(room))
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
+        if self._state_engine is not None:
+            raise NotImplementedError(
+                "Raiden push resharding does not move GDN (linear-attention) "
+                "state yet; use equal attention TP on prefill and decode."
+            )
         req = ReshardReq.from_frames(msg)
         room = req.room
         decode_ip = req.decode_ip
@@ -917,7 +1037,7 @@ class RaidenSenderMixin:
                         swa_blocks,
                         decode_swa_blocks,
                         layer_idx,
-                        parallelism=RESHARD_PUSH_PARALLELISM,
+                        parallelism=self._transfer_parallelism,
                     )
             # INFO, not debug: this is the only evidence the window actually
             # crossed. Everything else about a hybrid reshard looks identical
@@ -1084,7 +1204,7 @@ class RaidenSenderMixin:
                         prefill_blocks,
                         decode_blocks,
                         layer_idx,
-                        parallelism=RESHARD_PUSH_PARALLELISM,
+                        parallelism=self._transfer_parallelism,
                     )
         finally:
             # Frees the plan's staging on the sender; the receiver's is freed
@@ -1108,6 +1228,17 @@ class RaidenKVSender(CommonKVSender):
     # A group-wide Failed is delivered only after every rank drained: raiden
     # cannot cancel a transfer, so a peer's pages must not be freed under it.
     group_failure_requires_drain = True
+    # Whether the decode needs no ROOM_FAILED from this sender: one was sent,
+    # or the decode released the room itself.
+    _decode_told = False
+
+    @property
+    def pages_exposed_before_result(self) -> bool:
+        # A transfer may read the pages before the result point, which then
+        # keeps them out of the radix cache: stage groups and early close
+        # register a pipeline stage's pages at the final chunk's launch.
+        pipeline = self.kv_mgr._pipeline
+        return pipeline is not None and (pipeline.stage_parts or pipeline.early_close)
 
     def __init__(
         self,
@@ -1131,6 +1262,20 @@ class RaidenKVSender(CommonKVSender):
         # It is sent only after the decode reserved the request's KV pages, so
         # the prefill never computes KV that no decode can take yet.
         self.init_time = time.time()
+        # An ABORT that outran this sender only tombstoned the room (_on_abort
+        # saw no status). The status now exists, so _on_abort and this check
+        # are ordered by _state_lock: one of them fails the room.
+        if not self.kv_mgr.is_dummy_cp_rank:
+            with self.kv_mgr._state_lock:
+                if self.bootstrap_room in self.kv_mgr._aborted:
+                    self._decode_told = True
+                    self.kv_mgr._fail_room_locked(
+                        self.bootstrap_room,
+                        "Aborted by decode-side abort notification received "
+                        "before the sender was created.",
+                        preserve_reason=True,
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         super().init(num_kv_indices, aux_index)
@@ -1157,14 +1302,28 @@ class RaidenKVSender(CommonKVSender):
             if state_indices is not None
             else None
         )
+        state_rows = (
+            self.kv_mgr._state_rows_from_state_indices(state_indices)
+            if state_indices is not None
+            else None
+        )
         blocks = [int(x) for x in kv_indices]
-        start = self.kv_mgr.append_send_blocks(self.bootstrap_room, blocks, swa_blocks)
+        start = self.kv_mgr.append_send_blocks(
+            self.bootstrap_room,
+            blocks,
+            swa_block_ids=swa_blocks,
+            state_block_ids=state_rows,
+        )
         if start is None:
             return  # aborted while this chunk was being computed
         if self.kv_mgr.chunked_transfer and not self._last_chunk:
             self.kv_mgr.offer_chunk(
                 self.bootstrap_room, start, blocks, self.num_kv_indices
             )
+        elif not self._last_chunk and self.kv_mgr._pipeline is not None:
+            # A pipeline stage moves pages already final (a cached prefix,
+            # finished chunks) as early parts.
+            self.kv_mgr._pipeline.offer_part(self.bootstrap_room, start, blocks)
         if self._last_chunk and not self._started:
             self._started = True
             # finalize_send turns the room Transferring itself, under the
@@ -1196,7 +1355,13 @@ class RaidenKVSender(CommonKVSender):
         # Failed is withheld while a stage or push still reads the room's
         # pages -- the scheduler frees them on it.
         status = self.kv_mgr.check_status(self.bootstrap_room)
-        if status == KVPoll.Failed or self.kv_mgr.is_failed(self.bootstrap_room):
+        failed = self.kv_mgr.is_failed(self.bootstrap_room)
+        if failed:
+            # Told before the active-IO wait below: the decode need not wait
+            # out its own timeout. A decode ABORT (or a group quiesce) drops
+            # the room's failure marker with its state, so it is not answered.
+            self._tell_decode_room_failed()
+        if status == KVPoll.Failed or failed:
             if self.kv_mgr.sender_has_active_io(self.bootstrap_room):
                 return KVPoll.Transferring
             self.conclude_state = KVPoll.Failed
@@ -1232,10 +1397,9 @@ class RaidenKVSender(CommonKVSender):
         """Seal this rank before the group snapshots its native drain bit."""
         with self.kv_mgr._state_lock:
             self.kv_mgr._mark_aborted_locked(self.bootstrap_room)
-            self.kv_mgr._fail_room_locked(
+            self.kv_mgr._fail_room_unless_failed_locked(
                 self.bootstrap_room,
                 "Raiden transfer failed on another attention TP/CP rank.",
-                preserve_reason=True,
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         # A local Success may have been cached before a peer contributed the
@@ -1251,18 +1415,28 @@ class RaidenKVSender(CommonKVSender):
         The scheduler may recycle the request's blocks as soon as this sender
         is terminal. Keep ``conclude_state`` unset until every native read /
         stage / push lease has settled; the normal poll path then publishes
-        Failed.
+        Failed. A room that already failed keeps its reason.
         """
         with self.kv_mgr._state_lock:
             self.kv_mgr._mark_aborted_locked(self.bootstrap_room)
-            self.kv_mgr._fail_room_locked(self.bootstrap_room, "Aborted by AbortReq.")
+            self.kv_mgr._fail_room_unless_failed_locked(
+                self.bootstrap_room, "Aborted by AbortReq."
+            )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        # Before the drop, which forgets where the decode is.
+        self._tell_decode_room_failed()
         self.kv_mgr._drop_room_state(self.bootstrap_room)
         self.conclude_state = (
             None
             if self.kv_mgr.sender_has_active_io(self.bootstrap_room)
             else KVPoll.Failed
         )
+
+    def _tell_decode_room_failed(self) -> None:
+        if self._decode_told:
+            return
+        self._decode_told = True
+        self.kv_mgr.notify_decode_room_failed(self.bootstrap_room)
 
     def failure_exception(self):
         """Drop the room's state, then raise the recorded failure reason."""
@@ -1273,7 +1447,7 @@ class RaidenKVSender(CommonKVSender):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
         self.clear()
-        raise Exception(reason)
+        raise KVTransferError(self.bootstrap_room, reason)
 
     def clear(self) -> None:
         super().clear()

@@ -26,8 +26,14 @@ import os
 import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import sweep
 
-register_tpu_ci(est_time=420, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=170, suite="stage-a-test-tpu-unit", chips=1)
+# The DCP writer recompiles per rank at ~7s, so the 30 ranks of the four
+# (dcp_size, interleave_size) pairs are most of this file's 408s. The gate runs
+# the two small ones -- which still check the ownership partition exactly, over
+# every layout -- and the nightly adds dcp 8 and 16.
+register_tpu_ci(est_time=420, suite="nightly-tpu-4-v7", nightly=True)
 
 # Standalone raw-JAX kernel test, not a TorchTPU runtime process: select the
 # physical backend before the first JAX import below.
@@ -70,7 +76,7 @@ _LIVE_SPECS = (
 # (num_seqs, tokens_per_seq, max_seq_len, num_pages). The token counts span
 # `split_plan`'s branches: fewer blocks than subcores (lanes get split across
 # subcores) through more blocks than subcores (several pipeline steps).
-_SCENARIOS = (
+_ALL_SCENARIOS = (
     ("decode_b16", 16, 1, 1024, 64),
     ("decode_b64", 64, 1, 512, 128),
     ("decode_b256", 256, 1, 256, 256),
@@ -79,6 +85,17 @@ _SCENARIOS = (
     ("prefill_b4_t64", 4, 64, 512, 64),
     ("prefill_b16_t16", 16, 16, 1024, 64),
     ("prefill_b64_t16", 64, 16, 512, 128),
+)
+# One per end of each `split_plan` branch: the smallest and largest decode
+# batch, a single long prefill and the many-short-sequences prefill.
+_SCENARIOS = sweep(
+    _ALL_SCENARIOS,
+    (
+        ("decode_b16", 16, 1, 1024, 64),
+        ("decode_b256", 256, 1, 256, 256),
+        ("prefill_b1_t256", 1, 256, 1024, 64),
+        ("prefill_b64_t16", 64, 16, 512, 128),
+    ),
 )
 
 
@@ -132,12 +149,16 @@ class SparseMLAScatterTest(parameterized.TestCase):
         )
         block_tables = np.apply_along_axis(rng.permutation, 1, base_pages)
 
-        # Raw bytes, not sampled floats: fp8 has redundant NaN encodings, and
-        # the writers are byte transport -- every bit pattern must survive.
+        # Raw bytes, not sampled floats: every surviving fp8 bit pattern must
+        # round-trip through byte transport. Read the expected uint8 bytes back
+        # from the float8_e4m3fn tensors because TPU XLA canonicalizes -NaN
+        # (0xFF) to +NaN (0x7F) on float8_e4m3fn bitcast.
         key = jax.random.PRNGKey(42)
         k_nope, k_rope = jax.random.split(key, 2)
         kv_c_u8 = jax.random.randint(k_nope, (num_tokens, LKV_DIM), 0, 256, jnp.uint8)
         k_pe_u8 = jax.random.randint(k_rope, (num_tokens, ROPE_DIM), 0, 256, jnp.uint8)
+        kv_c_normed = jax.lax.bitcast_convert_type(kv_c_u8, jnp.float8_e4m3fn)
+        k_pe = jax.lax.bitcast_convert_type(k_pe_u8, jnp.float8_e4m3fn)
 
         specs = {
             name: SparseMLAKVCacheSpec.create(
@@ -156,10 +177,10 @@ class SparseMLAScatterTest(parameterized.TestCase):
         return {
             "specs": specs,
             "caches": {k: jnp.zeros(s.shape, s.jax_dtype) for k, s in specs.items()},
-            "kv_c_u8": kv_c_u8,
-            "kv_c_normed": jax.lax.bitcast_convert_type(kv_c_u8, jnp.float8_e4m3fn),
-            "k_pe_u8": k_pe_u8,
-            "k_pe": jax.lax.bitcast_convert_type(k_pe_u8, jnp.float8_e4m3fn),
+            "kv_c_u8": jax.lax.bitcast_convert_type(kv_c_normed, jnp.uint8),
+            "kv_c_normed": kv_c_normed,
+            "k_pe_u8": jax.lax.bitcast_convert_type(k_pe, jnp.uint8),
+            "k_pe": k_pe,
             "seq_lens": jnp.asarray(seq_lens),
             "block_tables": jnp.asarray(block_tables.reshape(-1)),
             "query_start_loc": jnp.asarray(query_start_loc),
@@ -369,7 +390,9 @@ class SparseMLAScatterTest(parameterized.TestCase):
             interleave_size=interleave_size,
             layout=layout,
         )
-        for dcp_size, interleave_size in ((2, 4), (4, 64), (8, 16), (16, 4))
+        for dcp_size, interleave_size in sweep(
+            ((2, 4), (4, 64), (8, 16), (16, 4)), ((2, 4), (4, 64))
+        )
         for layout in KVCacheLayout
     )
     def test_dcp_update_matches_the_jnp_writer(self, dcp_size, interleave_size, layout):

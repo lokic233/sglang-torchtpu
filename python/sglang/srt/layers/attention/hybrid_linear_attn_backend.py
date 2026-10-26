@@ -40,14 +40,13 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_pin_memory_available, is_tpu
+from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
 
 logger = logging.getLogger(__name__)
 
-_is_tpu = is_tpu()
 _validate_mamba_replay_state_indices = (
     envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
 )
@@ -110,6 +109,25 @@ class MambaAttnBackendBase(AttentionBackend):
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
+
+    def commit_verified_states(
+        self,
+        mamba_caches,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+        src_indices_raw: Optional[torch.Tensor],
+    ) -> None:
+        """Commit each verified request's state at its last accepted token."""
+        scatter_mamba_states_after_mtp_verify(
+            mamba_caches,
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw=src_indices_raw,
+        )
 
     @property
     def mamba_chunk_size(self) -> int:
@@ -280,36 +298,14 @@ class MambaAttnBackendBase(AttentionBackend):
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
-                if _is_tpu:
-                    # Per-sequence token offsets (exclusive cumsum) plus a final
-                    # total, derived from `extend_seq_lens` alone -- the same way the
-                    # TPU full-attention backend builds `cu_q_lens`
-                    # (attention_pallas_rpa_base.py). Padding-immune: the pad shim
-                    # zero-pads `extend_seq_lens` and zeros contribute nothing to a
-                    # cumsum, so padded rows describe zero-length queries for free.
-                    #
-                    # Do not mix in `extend_start_loc`: it is not in the shim's
-                    # `_BS_FIELDS` and so is not padded alongside `extend_seq_lens`,
-                    # which makes `[-1]` read a padding zero and zeroes the whole
-                    # tensor. query_lens then collapses to 0 and the GDN kernel
-                    # stores no recurrent state.
-                    #
-                    # cumsum promotes int32 -> int64, so pin the output dtype.
-                    query_start_loc = torch.zeros(
-                        (bs + 1,), dtype=torch.int32, device=self.device
-                    )
-                    query_start_loc[1:] = torch.cumsum(
-                        forward_batch.extend_seq_lens, dim=0, dtype=torch.int32
-                    )
-                else:
-                    query_start_loc = torch.empty(
-                        (bs + 1,), dtype=torch.int32, device=self.device
-                    )
-                    query_start_loc[:bs] = forward_batch.extend_start_loc
-                    query_start_loc[bs] = (
-                        forward_batch.extend_start_loc[-1]
-                        + forward_batch.extend_seq_lens[-1]
-                    )
+                query_start_loc = torch.empty(
+                    (bs + 1,), dtype=torch.int32, device=self.device
+                )
+                query_start_loc[:bs] = forward_batch.extend_start_loc
+                query_start_loc[bs] = (
+                    forward_batch.extend_start_loc[-1]
+                    + forward_batch.extend_seq_lens[-1]
+                )
                 if (
                     forward_batch.extend_seq_lens_cpu is not None
                     and len(forward_batch.extend_seq_lens_cpu) == bs
@@ -1258,6 +1254,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
         return None
 
+    def forward_indexer(self, indexer, *, layer_id: int, **kwargs):
+        # Only full-attention layers have a DSA indexer.
+        return self.full_attn_backend.forward_indexer(
+            indexer, layer_id=layer_id, **kwargs
+        )
+
     def on_after_cuda_graph_warmup(self):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()
@@ -1529,13 +1531,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        scatter_mamba_states_after_mtp_verify(
+        self.linear_attn_backend.commit_verified_states(
             mamba_caches,
             state_indices_tensor,
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
-            src_indices_raw=src_indices_raw,
+            src_indices_raw,
         )
 
         self._update_ple_state_after_mtp_verify(

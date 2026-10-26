@@ -39,12 +39,23 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+# fn(runner, topk, speculative_num_steps) -> multi-step draft decode container;
+# the draft extend of the same name builds the ATTENTION_BACKENDS entry.
+DRAFT_ATTENTION_BACKENDS = {}
 HYBRID_GDN_SM100_BACKENDS = {"triton", "trtllm_mha", "fa4", "flashinfer"}
 
 
 def register_attention_backend(name):
     def decorator(fn):
         ATTENTION_BACKENDS[name] = fn
+        return fn
+
+    return decorator
+
+
+def register_draft_attention_backend(name):
+    def decorator(fn):
+        DRAFT_ATTENTION_BACKENDS[name] = fn
         return fn
 
     return decorator
@@ -167,47 +178,7 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
-    if _is_tpu:
-        pool = runner.token_to_kv_pool
-        alloc = runner.token_to_kv_pool_allocator
-        kv_bytes = pool.get_kv_size_bytes()
-        total_gb = (kv_bytes[0] + kv_bytes[1]) / (1024**3)
-        swa_shape = tuple(pool.get_swa_buffer(0).shape)
-        c4_layer = next(
-            i
-            for i, m in enumerate(pool.layer_mapping)
-            if m is not None and m.compress_ratio == 4
-        )
-        csa_nope_shape = tuple(pool.get_csa_nope_buffer(c4_layer).shape)
-        csa_rope_shape = tuple(pool.get_csa_rope_buffer(c4_layer).shape)
-        indexer_shape = tuple(pool.get_indexer_k_buffer(c4_layer).shape)
-        c128_layer = next(
-            i
-            for i, m in enumerate(pool.layer_mapping)
-            if m is not None and m.compress_ratio == 128
-        )
-        hca_shape = tuple(pool.get_hca_buffer(c128_layer).shape)
-        c4_state_shape = tuple(
-            pool.get_state_buffer(c4_layer, from_indexer=False).shape
-        )
-        c4_idx_state_shape = tuple(
-            pool.get_state_buffer(c4_layer, from_indexer=True).shape
-        )
-        c128_state_shape = tuple(
-            pool.get_state_buffer(c128_layer, from_indexer=False).shape
-        )
-        logger.info(
-            f"[DSV4-TPU Stage 2 Verified] DSV4TPUTokenToKVPool & {type(alloc).__name__} initialized: "
-            f"kv_gb={total_gb:.2f} GiB, swa={swa_shape}, csa_nope={csa_nope_shape}, "
-            f"csa_rope={csa_rope_shape}, indexer={indexer_shape}, hca={hca_shape}, "
-            f"c4_state={c4_state_shape}, c4_idx_state={c4_idx_state_shape}, c128_state={c128_state_shape}"
-        )
-        raise NotImplementedError(
-            f"[DSV4-TPU Stage 2 Verified] DSV4TPUTokenToKVPool & {type(alloc).__name__} initialized "
-            f"({total_gb:.2f} GiB across {len(pool.layer_mapping)} layers). "
-            "Next step (Iteration 3): implement DSV4TPUAttnBackend skeleton & metadata."
-        )
-    elif _is_npu:
+    if _is_npu:
         from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
             DeepseekV4AscendAttnBackend,
         )
@@ -559,8 +530,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 hybrid_backend_cls = ShortConvHybridAttnBackend
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
-        elif kimi_linear_config(runner.model_config) is not None:
-            if _is_npu:
+        elif (
+            kimi_linear_config(runner.model_config) is not None
+            or glm5_next_config(runner.model_config) is not None
+        ):
+            # Kimi-Linear and GLM-5.3 share the KDA layer.
+            if _is_npu and kimi_linear_config(runner.model_config) is not None:
                 from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
                     AscendKDAAttnBackend,
                     AscendKDAHybridLinearAttnBackend,
@@ -573,14 +548,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     TpuKDAAttnBackend,
                 )
 
-                logger.info(
-                    "Using TPU KDA linear-attention backend for Kimi linear models."
-                )
+                logger.info("Using TPU KDA linear-attention backend.")
                 linear_attn_backend = TpuKDAAttnBackend(runner)
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
-        elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

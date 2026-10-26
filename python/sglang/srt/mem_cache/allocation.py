@@ -169,8 +169,7 @@ def write_cache_indices(
         # host-resident — the write becomes a trivial CPU scatter with no recompile,
         # at the cost of a per-forward `page_indices` H2D copy in the attention
         # backend. Static analysis predicts host-resident is a regression (the slot
-        # indices are device-produced and device-consumed; see
-        # docs/tpu-prs/PR_BODY-write-cache-vectorize.md), but the two approaches
+        # indices are device-produced and device-consumed), but the two approaches
         # should be measured (TTFT / throughput) to confirm.
         _write_req_to_token_vectorized(
             req_to_token_pool.req_to_token,
@@ -216,6 +215,9 @@ def get_last_loc(
         "torch_native",
         "pallas_tpu_rpa_v3",
         "pallas_tpu_rpa_batched",
+        "pallas_tpu_mla",
+        "pallas_tpu_mla_sparse",
+        "pallas_tpu_flash",
     )
     uses_triton_dispatch = (
         prefill_backend not in non_triton and decode_backend not in non_triton
@@ -294,6 +296,7 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
     out_cache_loc_host: Optional[torch.Tensor] = None,
+    return_host: bool = False,
 ):
     # Over estimate the number of tokens: assume each request needs a new page
     # (one page per CLASS per request under sharding — the min-class
@@ -320,6 +323,9 @@ def alloc_paged_token_slots_extend(
         # Per-call per-req table for the C128 KV last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+    if return_host or (batch is not None and batch.input_tensor_device == "cpu"):
+        # Opt-in allocators may defer the upload until forward-input padding.
+        extra_alloc_kwargs["return_host"] = True
     if out_cache_loc_host is not None:
         extra_alloc_kwargs["out_indices_cpu"] = out_cache_loc_host
 
@@ -496,7 +502,9 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(
         req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
     )
-    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+    req_pool_indices_device = req_pool_indices_cpu.to(
+        batch.metadata_device(), non_blocking=True
+    )
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
@@ -659,6 +667,7 @@ def alloc_paged_token_slots_decode(
     token_per_req: int = 1,
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
+    out_cache_loc_host: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -679,6 +688,8 @@ def alloc_paged_token_slots_decode(
         # Per-call per-req C128 table for the last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+    if out_cache_loc_host is not None:
+        extra_alloc_kwargs["out_indices_cpu"] = out_cache_loc_host
 
     with allocator.forward_write_target():
         out = allocator.alloc_decode(
@@ -719,6 +730,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     seq_lens = batch.seq_lens_cpu if _is_tpu else batch.seq_lens
     bs = seq_lens.shape[0]
+    out_cache_loc_host = None
 
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation
@@ -730,6 +742,10 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             # Host-resident pool: gather last_loc on host (alloc_decode runs
             # its formula on host).
             last_loc = _r2t[batch.req_pool_indices_cpu, seq_lens - 1]
+            if getattr(batch.req_to_token_pool, "host_resident", False):
+                # The allocator also fills out_cache_loc_host for the
+                # req_to_token write.
+                out_cache_loc_host = torch.empty((bs,), dtype=torch.int32)
         else:
             last_loc = _r2t[batch.req_pool_indices, seq_lens - 1]
         seq_lens_next = seq_lens + token_per_req
@@ -741,6 +757,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             token_per_req=token_per_req,
             req_pool_indices=batch.req_pool_indices,
             batch=batch,
+            out_cache_loc_host=out_cache_loc_host,
         )
 
     # Write to req_to_token_pool
@@ -749,7 +766,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         locs = seq_lens.clone()
 
-    if _is_tpu:
+    if out_cache_loc_host is not None:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices_cpu, locs), out_cache_loc_host
+        )
+    elif _is_tpu:
         batch.req_to_token_pool.write(
             (batch.req_pool_indices_cpu, locs), out_cache_loc.to(torch.int32)
         )

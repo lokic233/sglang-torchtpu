@@ -14,6 +14,8 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py
+# SGLang changes: load_activation_as_compact slices the conv output value
+# when the input buffer is bf16 (plain-decode compact path, no f32 copy).
 
 import math
 
@@ -56,12 +58,12 @@ def load_strided_heads(
 
 
 def load_compact_heads(
-    vmem_ref: jax.Ref, num_heads: int, head_dim: int, dim_offset: int = 0
+    vmem_ref: jax.Ref | jax.Array, num_heads: int, head_dim: int, dim_offset: int = 0
 ) -> jax.Array:
     """Use contiguous slices to split heads along the last dim and stack.
 
     Args:
-        vmem_ref: VMEM reference of shape [seq_tile_size, chunk_size, 1, cols].
+        vmem_ref: VMEM reference or value of shape [seq_tile_size, chunk_size, 1, cols].
         num_heads: Number of heads to split out.
         head_dim: Width of one head, in elements.
         dim_offset: Element the first head starts at, for a region that is
@@ -203,8 +205,8 @@ def _load_recurrent_state(
 def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
-    conv_state_slot_ref: jax.Ref,
-    recurrent_slot_ref: jax.Ref,
+    conv_state_in_slot_ref: jax.Ref,
+    recurrent_in_slot_ref: jax.Ref,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
@@ -217,16 +219,16 @@ def load_and_select_states(
     zero initialized.
 
     When `cfg.state_plan` is set, the state refs hold raw source-layout
-    tiles (see `memory_ref.ExternalStateBufferedRef`) and are decoded
+    tiles (see `memory_ref.ExternalStateInBufferedRef`) and are decoded
     through the plan's typed region views instead of read directly.
 
     Args:
         metadata_ref: Metadata reference containing grid and sequence mappings.
         p_id: Current Pallas program ID.
-        conv_state_slot_ref: Convolution state read from HBM of shape
-            [seq_tile_size, window_size, prev_kernel_size, 1, dim_size].
-        recurrent_slot_ref: Recurrent state read from HBM of shape [seq_tile_size,
-            window_size, num_v_heads, kq_head_dim, v_head_dim].
+        conv_state_in_slot_ref: Convolution state read from HBM of shape
+            [seq_tile_size, 1, prev_kernel_size, 1, dim_size].
+        recurrent_in_slot_ref: Recurrent state read from HBM of shape
+            [seq_tile_size, 1, num_v_heads, kq_head_dim, v_head_dim].
         carry_conv_scratch_ref: Optional inter-tile convolution carry of shape
             [seq_tile_size, prev_kernel_size, 1, dim_size].
         carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
@@ -251,18 +253,18 @@ def load_and_select_states(
         is_first_tile = metadata_ref.p_id_is_first_tile[p_id, idx]
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
-        # NOTE: The VMEM window holds one state per window position and the
-        # initial state was DMA'd into position 0.
+        # NOTE: The input VMEM window holds one initial state per sequence at
+        # position 0.
         # Both scratches are allocated together (see GDNConfig.scratch_shapes).
         # Only the pool decode is worth guarding; a dense slot read is cheap
         # enough that the guard costs more than it saves.
         if carry_conv_scratch_ref is None or cfg.state_plan is None:
             prev_conv_state = jnp.where(
-                has_initial_state, _load_conv_state(conv_state_slot_ref, cfg, idx), 0
+                has_initial_state, _load_conv_state(conv_state_in_slot_ref, cfg, idx), 0
             )
             prev_recurrent_state = jnp.where(
                 has_initial_state,
-                _load_recurrent_state(recurrent_slot_ref, cfg, idx),
+                _load_recurrent_state(recurrent_in_slot_ref, cfg, idx),
                 0,
             )
             if carry_conv_scratch_ref is not None:
@@ -282,12 +284,12 @@ def load_and_select_states(
             def _():
                 carry_conv_scratch_ref[idx] = jnp.where(
                     has_initial_state,
-                    _load_conv_state(conv_state_slot_ref, cfg, idx),
+                    _load_conv_state(conv_state_in_slot_ref, cfg, idx),
                     0,
                 )
                 carry_recurrent_scratch_ref[idx] = jnp.where(
                     has_initial_state,
-                    _load_recurrent_state(recurrent_slot_ref, cfg, idx),
+                    _load_recurrent_state(recurrent_in_slot_ref, cfg, idx),
                     0,
                 )
 
@@ -314,18 +316,21 @@ def load_activation_as_compact(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Load activations from VMEM as a compact layout."""
 
-    qkv_vmem_ref[...] = qkv_vreg
+    qkv_src = qkv_vmem_ref
+    if qkv_vmem_ref.dtype == qkv_vreg.dtype:
+        qkv_vmem_ref[...] = qkv_vreg
+    else:
+        # A bf16 input buffer cannot hold the f32 conv output; slice the value.
+        qkv_src = qkv_vreg
 
     k_offset = cfgs.num_kq_heads * cfgs.kq_head_dim
     v_offset = 2 * k_offset
 
-    q_compact = load_compact_heads(qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim)
+    q_compact = load_compact_heads(qkv_src, cfgs.num_kq_heads, cfgs.kq_head_dim)
     k_compact = load_compact_heads(
-        qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim, k_offset
+        qkv_src, cfgs.num_kq_heads, cfgs.kq_head_dim, k_offset
     )
-    v_compact = load_compact_heads(
-        qkv_vmem_ref, cfgs.num_v_heads, cfgs.v_head_dim, v_offset
-    )
+    v_compact = load_compact_heads(qkv_src, cfgs.num_v_heads, cfgs.v_head_dim, v_offset)
     b_compact = jnp.expand_dims(b_vmem_ref[...], axis=1)
     if cfgs.is_kda:
         # KDA's gate is per-channel, so it splits into heads like q/k/v do

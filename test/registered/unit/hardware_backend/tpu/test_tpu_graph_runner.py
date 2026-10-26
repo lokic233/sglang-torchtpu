@@ -37,6 +37,14 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.compilation.warmup_queue import collect_warmups
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.experimental.compilation.block_compile_policy import (
+    TpuBlockSpecDecodeCompilePolicyMixin,
+)
+from sglang_tpu.experimental.compilation.chain_compile_policy import (
+    TpuChainSpecDecodeCompilePolicyMixin,
+)
+from sglang_tpu.graph_runner import tpu_graph_runner
 from sglang_tpu.graph_runner.tpu_graph_runner import (
     TpuGraphRunner,
     _augment_spec_policy,
@@ -233,6 +241,24 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertFalse(kwargs["dynamic"])
         self.mock_register.assert_called_once()
 
+    def test_native_mtp_discovers_named_root_only(self):
+        child = self._annotate(_model_with(forward=MagicMock()))
+        child_forward = child.forward
+        model = self._annotate(_model_with(forward=MagicMock()))
+        model.named_modules = lambda: [("", model), ("backbone", child)]
+        runner = self._runner_for(model)
+        runner.is_draft_worker = True
+        runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        # Exercise discovery independently of device-specific speculative tracing.
+        with patch(
+            "sglang_tpu.graph_runner.tpu_graph_runner._augment_spec_policy",
+            side_effect=lambda cls, _: cls,
+        ):
+            TpuGraphRunner(runner)
+        self.assertIs(runner.compile_policy.owner, model)
+        self.assertEqual(runner.compile_policy.name, "draft/forward")
+        self.assertIs(child.forward, child_forward)
+
     def test_module_annotation_wraps_forward_only(self):
         model = self._annotate(
             _model_with(
@@ -248,7 +274,9 @@ class TestTpuGraphRunner(CustomTestCase):
     def test_queues_all_modules_before_waiting_for_warmups(self):
         events = []
         modules = [self._annotate(_model_with(forward=MagicMock())) for _ in range(2)]
-        model = _model_with(modules=lambda: modules)
+        model = _model_with(
+            named_modules=lambda: [(str(i), module) for i, module in enumerate(modules)]
+        )
 
         def precompile():
             index = len(events)
@@ -273,7 +301,11 @@ class TestTpuGraphRunner(CustomTestCase):
         with collect_warmups() as queue:
             for _ in range(3):
                 module = self._annotate(_model_with(forward=MagicMock()))
-                TpuGraphRunner(self._runner_for(_model_with(modules=lambda: [module])))
+                TpuGraphRunner(
+                    self._runner_for(
+                        _model_with(named_modules=lambda: [("decoder", module)])
+                    )
+                )
             self.assertEqual(events, [("submit", i) for i in range(3)])
         self.assertEqual(
             events, [("submit", i) for i in range(3)] + [("wait", i) for i in range(3)]
@@ -396,23 +428,22 @@ class TestTpuGraphRunner(CustomTestCase):
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
 
-    def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
-        # EAGLE3 spec composes the Eagle3 spec mixin over the resolved policy.
-        mr = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
-            server_args=SimpleNamespace(
-                speculative_num_steps=3, speculative_algorithm="EAGLE3"
-            ),
-        )
-        cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
-        self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
-        self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
-        self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
-        # Idempotent: a policy that already implements spec is left untouched.
-        self.assertIs(_augment_spec_policy(cls, mr), cls)
+    def test_experimental_worker_takes_eagle_family_to_the_chain_policy(self):
+        for algo, name in (
+            (SpeculativeAlgorithm.EAGLE, "EAGLE"),
+            (SpeculativeAlgorithm.EAGLE3, "EAGLE3"),
+        ):
+            mr = SimpleNamespace(
+                spec_algorithm=algo,
+                server_args=SimpleNamespace(
+                    speculative_num_steps=3, speculative_algorithm=name
+                ),
+            )
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+            self.assertTrue(issubclass(cls, TpuChainSpecDecodeCompilePolicyMixin))
+            self.assertFalse(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
 
-    def test_augment_spec_policy_mixes_spec_over_base_for_dflash(self):
-        # DFLASH spec composes the DFlash spec mixin over the resolved policy.
+    def test_experimental_worker_takes_dflash_to_the_block_policy(self):
         mr = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             server_args=SimpleNamespace(
@@ -420,7 +451,55 @@ class TestTpuGraphRunner(CustomTestCase):
             ),
         )
         cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, TpuBlockSpecDecodeCompilePolicyMixin))
+        self.assertFalse(issubclass(cls, TpuChainSpecDecodeCompilePolicyMixin))
+
+    def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
+        # EAGLE3 spec composes the Eagle3 spec mixin over the resolved policy
+        # when the experimental spec worker is disabled.
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+            server_args=SimpleNamespace(
+                speculative_num_steps=3, speculative_algorithm="EAGLE3"
+            ),
+        )
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
+        # Idempotent: a policy that already implements spec is left untouched.
+        self.assertIs(_augment_spec_policy(cls, mr), cls)
+
+    def test_augment_spec_policy_mixes_spec_over_base_for_native_mtp(self):
+        # EAGLE spec composes the Eagle3 spec mixin over the resolved policy.
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            server_args=SimpleNamespace(
+                speculative_num_steps=3, speculative_algorithm="EAGLE"
+            ),
+        )
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
+        # Idempotent: a policy that already implements spec is left untouched.
+        self.assertIs(_augment_spec_policy(cls, mr), cls)
+
+    def test_augment_spec_policy_mixes_spec_over_base_for_dflash(self):
+        # DFLASH spec composes the DFlash spec mixin over the resolved policy
+        # when the experimental spec worker is disabled.
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            server_args=SimpleNamespace(
+                speculative_num_steps=3, speculative_algorithm="DFLASH"
+            ),
+        )
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
         self.assertTrue(issubclass(cls, DFlashSpecDecodeCompilePolicyMixin))
+        self.assertFalse(issubclass(cls, TpuBlockSpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
         self.assertIs(_augment_spec_policy(cls, mr), cls)
@@ -549,7 +628,7 @@ class TestTpuGraphRunner(CustomTestCase):
         for is_draft_worker in (False, True):
             vision_module = _VisionModule()
             model = _model_with()
-            model.modules = lambda: (model, vision_module)
+            model.named_modules = lambda: (("", model), ("vision", vision_module))
             runner = self._runner_for(model)
             runner.is_draft_worker = is_draft_worker
             TpuGraphRunner(runner)
@@ -557,6 +636,37 @@ class TestTpuGraphRunner(CustomTestCase):
             self.assertTrue(vision_module.precompiled)
         self.assertEqual(events, ["cache-key", "install", "precompile"] * 2)
         self.mock_compile.assert_not_called()
+
+    def test_warns_when_only_non_decoder_policies_install(self):
+        # A vision-only annotation skips the whole-model fallback, so the
+        # decoder runs eager; the runner must say so instead of staying silent.
+        class _VisionPolicy(CompilePolicy):
+            platform = "tpu"
+
+            def install(self) -> bool:
+                return True
+
+            def precompile(self) -> None:
+                pass
+
+        class _VisionModule:
+            def forward(self):
+                pass
+
+        support_torch_compile(_VisionModule, policy=_VisionPolicy)
+        model = _model_with()
+        model.named_modules = lambda: (("", model), ("vision", _VisionModule()))
+        with self.assertLogs(tpu_graph_runner.logger, level="WARNING") as logs:
+            TpuGraphRunner(self._runner_for(model))
+        self.assertTrue(
+            any("decode steps run eager" in line for line in logs.output), logs.output
+        )
+        self.mock_compile.assert_not_called()
+
+    def test_decoder_policy_install_does_not_warn(self):
+        model = self._annotate(_model_with(forward=MagicMock()))
+        with self.assertNoLogs(tpu_graph_runner.logger, level="WARNING"):
+            TpuGraphRunner(self._runner_for(model))
 
     def test_invalid_assignment_prevents_compilation(self):
         self.mock_cache_key.side_effect = RuntimeError("Invalid TPU rank assignment")
@@ -581,7 +691,7 @@ class TestTpuGraphRunner(CustomTestCase):
         foreign_module = _model_with(forward=MagicMock())
         support_torch_compile(foreign_module, policy=_CudaPolicy)
         model = _model_with(forward=MagicMock())
-        model.modules = lambda: (model, foreign_module)
+        model.named_modules = lambda: (("", model), ("foreign", foreign_module))
         runner = self._runner_for(model)
 
         TpuGraphRunner(runner)
@@ -744,6 +854,12 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         events = []
         worker = object.__new__(EagleDraftWorker)
         worker.speculative_num_steps = 3
+        from sglang.srt.runtime_context import get_flags
+
+        # ExitStack rather than enterContext, which is 3.11+.
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(get_flags().capture.override(enable_torch_compile=True))
         worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
         worker.draft_tp_context = lambda _group, **_kwargs: contextlib.nullcontext()
         worker.draft_owns_attention = False

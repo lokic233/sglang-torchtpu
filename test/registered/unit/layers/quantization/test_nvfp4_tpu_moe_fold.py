@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 BLOCK_SIZE = 512
 SUPPORTED_BLOCK_SIZES = (16, 32, 64, 128, 256, BLOCK_SIZE)
@@ -424,7 +424,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         torch.testing.assert_close(
             call["topk_ids"],
-            torch.tensor([[0, 0], [0, 1]], dtype=torch.int32),
+            torch.tensor([[0, -1], [-1, 1]], dtype=torch.int32),
         )
         self.assertEqual(tuple(result.hidden_states.shape), (2, 2, HIDDEN_SIZE))
 
@@ -463,13 +463,14 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     tuple(layer.w13_weight.shape),
                     (EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE),
                 )
+                # Fused-RS takes compact [E, K_blocks, N] scales (no unit dim).
                 self.assertEqual(
                     tuple(layer.w13_weight_scale.shape),
-                    (EXPERTS, HIDDEN_SIZE // group_size, 1, 2 * INTERMEDIATE_SIZE),
+                    (EXPERTS, HIDDEN_SIZE // group_size, 2 * INTERMEDIATE_SIZE),
                 )
                 self.assertEqual(
                     tuple(layer.w2_weight_scale.shape),
-                    (EXPERTS, INTERMEDIATE_SIZE // group_size, 1, HIDDEN_SIZE),
+                    (EXPERTS, INTERMEDIATE_SIZE // group_size, HIDDEN_SIZE),
                 )
 
     def test_fused_prepare_supplies_every_attribute_apply_reads(self):
@@ -491,7 +492,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
             # here (it needs an initialized TP group). Keep the attribute names
             # in sync with that function.
             prepared_layer._tpu_fused_rs_group_offset = torch.tensor(
-                [0, 0], dtype=torch.int32
+                [0], dtype=torch.int32
             )
 
         hidden_states = torch.randn(3, HIDDEN_SIZE, dtype=torch.bfloat16)
@@ -548,7 +549,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
-        layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
+        layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
         layer.moe_ep_size = 1
         from sglang_tpu.moe.pallas import fused_moe_rs_op
 
@@ -597,9 +598,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 )
                 layer = _make_block512_layer(include_unused_params=False)
                 layer._tpu_fused_rs_has_post_expert_norm = False
-                layer._tpu_fused_rs_group_offset = torch.tensor(
-                    [0, 0], dtype=torch.int32
-                )
+                layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
                 layer.moe_ep_size = 1
                 fused_moe_rs_gather = mock.Mock(
                     side_effect=lambda **kwargs: kwargs["hidden_states"]
@@ -663,7 +662,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
-        layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
+        layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
         layer.moe_ep_size = 2
 
         # Model rank 0's output is the first partition of each kernel result.

@@ -110,6 +110,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
 )
+from sglang.srt.managers.scheduler_components.node_fanout import node_fanout_enabled
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -1696,7 +1697,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
-            tokenized_obj = wrap_shm_features(tokenized_obj)
+            tokenized_obj = wrap_shm_features(
+                tokenized_obj,
+                force=node_fanout_enabled(),
+            )
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
@@ -1716,10 +1720,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         Only dispatched requests are aborted (not discarded) by the
         handler-failure cleanup; see _release_req_states_on_failure.
+
+        An abort sent before dispatch matched nothing on the scheduler, and
+        abort_sent turns every later abort for the rid into a no-op, so resend
+        it here. ZMQ ordering delivers it after the request.
         """
         state = self.rid_to_state.get(rid)
-        if state is not None:
-            state.dispatched = True
+        if state is None:
+            return
+        state.dispatched = True
+        if state.abort_sent:
+            try:
+                self._dispatch_to_scheduler(AbortReq(rid=rid))
+            except Exception:
+                # Let a later abort (e.g. client disconnect) try again.
+                state.abort_sent = False
+                logger.exception("Failed to resend abort for request %s", rid)
 
     async def _send_batch_request(
         self,

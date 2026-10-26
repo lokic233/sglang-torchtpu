@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Vendored from https://github.com/sgl-project/sglang-jax
-# python/sgl_jax/srt/kernels/mla/v2/tuned_block_sizes.py — only the two import
-# paths are rewritten to the local pallas package. The tuned entries and their
-# provenance comments are upstream content; re-sync from sglang-jax when new
-# shapes are tuned there (and upstream new entries tuned here).
+# python/sgl_jax/srt/kernels/mla/v2/tuned_block_sizes.py -- the two import
+# paths are rewritten to the local pallas package. SGLang changes: the fp8 KV
+# rows and the TPU v7 "4 q heads per shard, page 128" rows were tuned in this
+# repo (see their comments); the other entries and their provenance comments
+# are upstream content. Re-sync from sglang-jax when new shapes are tuned there,
+# keeping the local rows (and upstream new entries tuned here).
 """Auto-tuned block sizes for the MLA v2 Pallas kernel.
 
 The MLA v2 kernel (`mla_ragged_paged_attention`) accepts three block-size slots
@@ -62,7 +64,7 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # ===== DeepSeek-V3 (kv_lora_rank=512, qk_rope_head_dim=64) =====
         # Deploy: --tp-size 64 --dp-size 8 --page-size 128
         # → attention_tp = 8 → per-shard num_q_heads = 128/8 = 16.
-        # Tuned 2026-06-05 on chavoshi-us-east5-b-2 v6e-64 via
+        # Tuned 2026-06-05 on a v6e-64 slice via
         # benchmark/kernels/mla/get_block_spec_config_mla.py (kv_len=4096).
         ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 1): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 8): (16, 1, 2),
@@ -85,7 +87,7 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
     },
     "TPU v7": {
         # ===== Ling-2.6-1T (kv_lora_rank=512, qk_rope_head_dim=64) =====
-        # Production deploy: --tp-size 32 --dp-size 4 --page-size 256
+        # Deploy: --tp-size 32 --dp-size 4 --page-size 256
         # → attention_tp = tp/dp = 8 → per-shard num_q_heads = 64/8 = 8.
         # Server-jit per-shard mnt buckets (= global / dp_size=4):
         #   decode bs_buckets = [64,128,256,512] → per-shard mnt {16,32,64,128}
@@ -95,12 +97,12 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         #   prefill chunk per-shard mnt = 2048/4 = 512 (mixed case)
         #   decode per-shard mnt depends on running req count (∈ above)
         #
-        # Tuned 2026-05-29 on falcon exp-vj0fm1psbw (single v7x host, 8 cores)
+        # Tuned 2026-05-29 on a single v7x host (8 cores)
         # against hardcoded heuristic decode=(3,1,4) / mixed=(1,16).
         # Tuner uses scope-name-matched extraction of pallas_call
         # device_duration_ps (matches the kernel's `MLA-bd-...` /
         # `MLA-m-...` named_scope) → pure kernel device time.
-        # Cross-validated: production profiling shows decode dp=4 tp=8 with
+        # Cross-validated: a serving profile of decode dp=4 tp=8 with
         # 128-concurrency (per-DP 32) ≈ 350us; tuner heur (3,1,4) at
         # mnt=32 measured 347us — match.
         #
@@ -111,7 +113,7 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         #   decode mnt=128: +20.0%  (1.104ms vs 1.380ms)
         #   mixed mnt=512:  +85.6%  (0.266ms vs 1.841ms)
         #   mixed mnt=1024: +86.2%  (0.546ms vs 3.966ms)
-        #   mixed mnt=2048: +87.2%  (1.162ms vs 9.065ms)  ← user prefill chunk
+        #   mixed mnt=2048: +87.2%  (1.162ms vs 9.065ms)  ← chunked-prefill size
         #   mixed mnt=4096: +88.4%  (2.616ms vs 22.638ms)
         #
         # See benchmark/kernels/mla/get_block_spec_config_mla.py.
@@ -168,12 +170,31 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 2048): (16, 128),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 4096): (16, 128),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 8192): (16, 128),
-        # fp8 KV rows, tuned with profiles/kimi-k26/opt/tune_mla_fp8.py on one v7x core.
-        # Kimi-K2.6 tp=16 (4 heads, page 128)
+        # fp8 KV rows, tuned on one v7x core.
+        # 4 q heads per shard, page 128: Kimi-K3 TP32 (3 -> 4) and Kimi-K2.6
+        # TP16. Each entry minimizes the worst-case slowdown vs the best block
+        # per workload (decode: kv 512 / 2048 / 8192; mixed: a fresh chunk and
+        # one behind a 4k prefix): <= 1.10x decode, <= 1.04x mixed. Against the
+        # untuned fallback, decode bs 8 at kv 8192 runs 2.1x faster and a
+        # 1024-token chunk 12x.
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 1): (16, 1, 1),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 2): (16, 1, 2),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 4): (8, 1, 4),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 8): (8, 1, 8),
         ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 16): (8, 1, 8),
-        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 64): (8, 1, 4),
-        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 128): (16, 1, 8),
-        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 8192): (16, 256),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 32): (8, 1, 8),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 64): (8, 1, 8),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 128): (8, 1, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 16): (8, 16),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 32): (8, 32),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 64): (4, 64),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 128): (4, 128),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 256): (4, 256),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 512): (4, 512),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 1024): (8, 1024),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 2048): (8, 1024),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 4096): (8, 1024),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 8192): (8, 1024),
         # DeepSeek-R1 tp=8 (16 heads, page 128)
         ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 64): (
             32,
@@ -340,6 +361,38 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ),  # Capped from 32 to prevent VMEM OOM when dbs=4
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 8192): (1, 512),
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 16384): (1, 512),
+        # ===== 4 q heads per shard, page 128: Kimi-K3 TP32 (3 -> 4),
+        # DeepSeek-V3/R1 TP32, Kimi-K2.6 TP16 =====
+        # v7x, 3 and 4 heads: each entry minimizes the worst-case slowdown vs
+        # the best block per workload. Decode over kv 512-8192: <= 1.16x up to
+        # bs 16, <= 1.33x above. Mixed over fresh, 4k-prefix and 4/8-sequence
+        # prefills: <= 1.38x.
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (8, 1, 8),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (8, 32),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (8, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (8, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (4, 256),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (4, 256),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (4, 512),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2048): (4, 512),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4096): (4, 512),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 8192): (8, 1024),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 16384): (8, 1024),
     },
 }
 

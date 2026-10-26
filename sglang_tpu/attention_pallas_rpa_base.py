@@ -65,6 +65,7 @@ from sglang_tpu.cp_forward import (
     get_tpu_cp_layout,
 )
 from sglang_tpu.cp_layout import TpuCpHostLayout
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 from sglang_tpu.kv_row_write import (
     get_write_rows_op,
@@ -127,6 +128,9 @@ class PallasForwardMetadata:
     # Static query rows per DECODE sequence for this forward (1 = ordinary
     # decode); above 1 the active rows take the kernel's DECODE range.
     decode_query_size: int = 1
+    # Kernel passes ``distribution`` can populate ("all" | "decode" | "mixed"),
+    # chosen with it in _build_metadata. Only the MLA v2 kernel reads it.
+    segments: str = "all"
     # Prefill context parallelism only (None otherwise). The kernel then runs
     # two rows per request (one per owned zigzag block) on this rank's local
     # token rows; see ``cp_layout``.
@@ -179,6 +183,47 @@ def _is_fixed_width_eagle_refresh(forward_batch) -> bool:
         and spec_info is not None
         and spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
         and spec_info.num_tokens_per_req > 0
+    )
+
+
+def _pool_kv_pack_heads(pool) -> int:
+    """Heads the fused pool stores side by side in one row (``kv_pack_heads``), or 1."""
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+    pools = (
+        (pool.full_kv_pool, pool.swa_kv_pool)
+        if isinstance(pool, SWAKVPool)
+        else (pool,)
+    )
+    packs = {
+        p.kv_pack_heads if isinstance(p, TpuFusedMHATokenToKVPool) else 1 for p in pools
+    }
+    if len(packs) != 1:
+        raise NotImplementedError(f"SWA sub-pools pack KV heads differently: {packs}")
+    return packs.pop()
+
+
+def _pack_qkv_heads(q, k, v, pack: int):
+    """q ``[T, Hq, d]``, k/v ``[T, pack, d]`` -> one kv head of width ``pack * d``.
+
+    K/V rows are the heads side by side; each query head carries its q in its kv
+    head's lanes and zeros elsewhere, so it scores only its own head's keys and its
+    output lands in those lanes (``_unpack_out_heads``). Built with a one-hot
+    multiply: torch_tpu returns wrong values for strided head slices joined by ``cat``.
+    """
+    T, hq, d = q.shape
+    eye = torch.eye(pack, dtype=q.dtype, device=q.device).view(1, pack, 1, pack, 1)
+    q = (q.reshape(T, pack, hq // pack, 1, d) * eye).reshape(T, hq, pack * d)
+    return q, k.reshape(T, 1, pack * d), v.reshape(T, 1, pack * d)
+
+
+def _unpack_out_heads(out, pack: int, d: int):
+    """``[T, Hq, pack * d]`` -> ``[T, Hq, d]``: each head's own lanes (one-hot sum, exact)."""
+    T, hq, _ = out.shape
+    eye = torch.eye(pack, dtype=out.dtype, device=out.device).view(1, pack, 1, pack, 1)
+    return (
+        (out.reshape(T, pack, hq // pack, pack, d) * eye).sum(dim=3).reshape(T, hq, d)
     )
 
 
@@ -741,6 +786,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return width if lens and all(n == width for n in lens) else 1
         return 1
 
+    def warmup_distributions(self, max_live: int, device) -> None:
+        """Warm fixed-shape metadata; live row counts are tensor values."""
+        # Serving keys use tensor.device (e.g. tpu:0), not the runner's "tpu".
+        device = torch.empty(0, device=device).device
+        for is_decode in (False, True):
+            self._get_cached_rpa_distribution(is_decode, max_live, device)
+
     def _get_cached_rpa_distribution(
         self, is_decode: bool, non_empty_bs: int, device
     ) -> torch.Tensor:
@@ -752,7 +804,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return cached
 
         dist = self._make_rpa_distribution_cpu(is_decode, non_empty_bs).to(device)
-        dist.tolist()  # one-time blocking sync: wait until the H2D completes
+        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get():
+            dist.tolist()  # one-time blocking sync: wait until the H2D completes
         self._distribution_cache[key] = dist
         return dist
 
@@ -771,6 +824,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 for slot in self.kernel_spec.extend_distribution_mask
             ]
         )
+
+    def _kernel_segments(self, forward_batch: ForwardBatch, is_decode: bool) -> str:
+        """Kernel passes the ``distribution`` built from ``is_decode`` can
+        populate. A static kernel arg, so it may only depend on values fixed
+        per compiled graph."""
+        return "all"
 
     def _build_metadata(
         self,
@@ -796,11 +855,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         page_size = self.page_size
         device = forward_batch.seq_lens.device
         decode_query_size = self._forward_decode_query_size(forward_batch)
+        is_decode = forward_batch.forward_mode.is_decode() or decode_query_size > 1
         distribution = self._get_cached_rpa_distribution(
-            forward_batch.forward_mode.is_decode() or decode_query_size > 1,
-            non_empty_bs,
-            device,
+            is_decode, non_empty_bs, device
         )
+        segments = self._kernel_segments(forward_batch, is_decode)
         bs = int(forward_batch.seq_lens.shape[0])
         req_to_token = self.req_to_token_pool.req_to_token
         pages_per_seq = _get_pages_per_seq(self.max_context_len, self._page_stride)
@@ -819,6 +878,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 distribution,
                 non_empty_bs,
                 decode_query_size,
+                segments,
             )
 
         if self._dcp > 1:
@@ -932,6 +992,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
             swa_page_indices=swa_page_indices,
             decode_query_size=decode_query_size,
+            segments=segments,
         )
 
     def _get_query_metadata(
@@ -993,6 +1054,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         distribution: torch.Tensor,
         non_empty_bs: int,
         decode_query_size: int = 1,
+        segments: str = "all",
     ) -> PallasForwardMetadata:
         """Build metadata on the CPU and reuse cached device copies when possible.
 
@@ -1208,6 +1270,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             dcp_write=write_spans,
             dcp_swa_write=swa_write_spans,
             decode_query_size=decode_query_size,
+            segments=segments,
         )
 
     def _host_page_columns(self, pages_per_seq: int, page_size: int) -> torch.Tensor:
@@ -1460,6 +1523,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
 
+    def _kv_lens(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        # The fused draft loop runs every step on step 0's metadata and passes
+        # each step's KV length in-graph.
+        draft_kv_lens = getattr(forward_batch.spec_info, "rpa_draft_kv_lens", None)
+        if draft_kv_lens is not None:
+            return draft_kv_lens
+        return self.forward_metadata.kv_lens
+
     def _forward(
         self,
         q: torch.Tensor,
@@ -1492,6 +1563,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # (or output slicing) is needed; until then this keeps K==V width.
         if layer.v_head_dim < layer.qk_head_dim:
             v = torch.nn.functional.pad(v, (0, layer.qk_head_dim - layer.v_head_dim))
+        # Packed pools (SGLANG_TPU_KV_PACK_HEADS) hold this rank's kv heads side by side.
+        pack = _pool_kv_pack_heads(self.token_to_kv_pool)
+        if pack > 1:
+            if self._dcp != 1 or pack != layer.tp_k_head_num:
+                raise NotImplementedError(
+                    "packed KV heads need dcp 1 and all local heads packed"
+                )
+            q, k, v = _pack_qkv_heads(q, k, v, pack)
 
         kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
@@ -1566,12 +1645,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 quantize=quantize_kv,
             )
 
-        draft_kv_lens = getattr(forward_batch.spec_info, "rpa_draft_kv_lens", None)
-        kv_lens = (
-            draft_kv_lens
-            if draft_kv_lens is not None
-            else self.forward_metadata.kv_lens
-        )
+        kv_lens = self._kv_lens(forward_batch)
         if self._dcp > 1:
             if not use_causal_mask:
                 raise NotImplementedError(
@@ -1634,7 +1708,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # K/V the trailing (qk - v) columns come from the zero-padded V slots and
         # are dropped here so o_proj receives exactly tp_q_head_num * v_head_dim.
         # When qk == v this view+slice is a no-op reshape.
-        out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
+        out = out.reshape(num_tokens, layer.tp_q_head_num, -1)
+        if pack > 1:
+            out = _unpack_out_heads(out, pack, layer.qk_head_dim)
+        out = out[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
     def _forward_dcp(
@@ -1783,32 +1860,24 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         return 0
 
 
-class BaseTpuPallasRpaMultiStepDraftBackend:
-    """Wrap one RPA backend per EAGLE draft decode step.
+class TpuPallasRpaMultiStepDraftBackend:
+    """Wrap one attention backend per EAGLE draft decode step.
 
     Each step's backend carries a different ``speculative_step_id`` so
-    ``_build_metadata`` bumps ``seq_lens`` by the right offset, mirroring
-    ``TpuPallasMultiStepDraftBackend`` for the flash backend. Subclasses set
-    :attr:`attn_backend_cls` to the per-step backend to instantiate.
+    ``_build_metadata`` bumps ``seq_lens`` by the right offset.
     """
-
-    # Set by each subclass to the concrete per-step attention backend class.
-    attn_backend_cls: ClassVar[type | None] = None
 
     def __init__(
         self,
         model_runner: "ModelRunner",
         topk: int,
         speculative_num_steps: int,
+        attn_backend_cls: type[BaseTpuPallasRpaAttnBackend],
     ):
-        if self.attn_backend_cls is None:
-            raise ValueError(
-                f"{type(self).__name__} must set a class-level attn_backend_cls."
-            )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends = [
-            self.attn_backend_cls(model_runner, speculative_step_id=i)
+            attn_backend_cls(model_runner, speculative_step_id=i)
             for i in range(self.speculative_num_steps - 1)
         ]
 

@@ -18,10 +18,6 @@ Each layer buffer is donated and aliased to its own output -- the in-place
 contract kv_page_write, the RPA v3 attention kernel, and
 TpuFusedMHATokenToKVPool.set_kv_buffer all share. K arrives normalized (post
 apply_k_norm) and unrotated; the K/V projections stay outside as XLA GEMMs.
-
-jax is imported eagerly, unlike the neighbouring Pallas modules: torch_tpu
-resolves the JAX-level signature with inspect.signature(eval_str=True), so its
-annotations have to be real names in this module's globals.
 """
 
 from __future__ import annotations
@@ -36,6 +32,11 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 _OP_NAME = "sglang_tpu::kv_fused_rope_write"
+
+
+def _op_name(num_layers: int, max_span_len: int) -> str:
+    """``namespace::name`` of the op built for one layer count and span bound."""
+    return f"{_OP_NAME}_{num_layers}_{max_span_len}"
 
 
 def _kernel(dst_ref, src_ref, len_ref, k_hbm, v_hbm, cos_hbm, sin_hbm, *rest):
@@ -209,16 +210,9 @@ def get_fused_rope_write_op(num_layers: int, max_span_len: int) -> Callable[...,
 
     # Tensors only: custom_jax_kernel traces a partial's `max_span_len` since
     # torch_tpu 76284a1fa; register a functools.partial once it reaches jax.jit static.
-    def _fused_rope_write(
-        dst_starts: jax.Array,
-        src_starts: jax.Array,
-        span_lens: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        cos: jax.Array,
-        sin: jax.Array,
-        *kv_bufs: jax.Array,
-    ) -> list[jax.Array]:
+    # Unannotated: when dynamo traces this builder it rebuilds the closure with misaligned
+    # __annotations__, and custom_jax_kernel's inspect.signature(eval_str=True) evals them.
+    def _fused_rope_write(dst_starts, src_starts, span_lens, k, v, cos, sin, *kv_bufs):
         return fused_rope_write_kv_jax(
             dst_starts,
             src_starts,
@@ -241,7 +235,7 @@ def get_fused_rope_write_op(num_layers: int, max_span_len: int) -> Callable[...,
     )
 
     @torch.library.custom_op(
-        f"{_OP_NAME}_{num_layers}_{max_span_len}",
+        _op_name(num_layers, max_span_len),
         mutates_args=("kv",),
         device_types=["tpu"],
     )
@@ -274,6 +268,18 @@ def get_fused_rope_write_op(num_layers: int, max_span_len: int) -> Callable[...,
     return op
 
 
+@torch._dynamo.assume_constant_result
+def _fused_rope_write_op_name(num_layers: int, max_span_len: int) -> str:
+    """Build the op eagerly, even under dynamo, and return its torch.ops name.
+
+    Dynamo ignores lru_cache and cannot trace the builder (custom_op's
+    infer_schema, the jax kernel's id()), so calling it in a compiled region
+    breaks the graph.
+    """
+    get_fused_rope_write_op(num_layers, max_span_len)
+    return _op_name(num_layers, max_span_len)
+
+
 def fused_rope_write_kv(
     *,
     dst_starts: torch.Tensor,
@@ -301,7 +307,10 @@ def fused_rope_write_kv(
         kv_heads_packed, kv_packing, padded_head_dim]; mutated in place.
       max_span_len: Upper bound on span_lens.
     """
-    get_fused_rope_write_op(len(kv_bufs), max_span_len)(
+    # Resolved through torch.ops by name so dynamo keeps the caller in one graph.
+    namespace, name = _fused_rope_write_op_name(len(kv_bufs), max_span_len).split("::")
+    op = getattr(getattr(torch.ops, namespace), name)
+    op(
         dst_starts.to(torch.int32),
         src_starts.to(torch.int32),
         span_lens.to(torch.int32),
