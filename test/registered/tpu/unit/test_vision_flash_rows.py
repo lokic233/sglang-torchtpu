@@ -200,6 +200,7 @@ class TestVisionFlashRowsJax(CustomTestCase):
     """The op's JAX body, with the Pallas kernel swapped for the JAX reference attention."""
 
     def _check(self, seg, row_len, h, d, seed, pad_index=0):
+        import jax
         import jax.numpy as jnp
         import numpy as np
 
@@ -221,12 +222,15 @@ class TestVisionFlashRowsJax(CustomTestCase):
                 pads, torch.tensor(pad_index, dtype=torch.int32), rows.row_index
             )
         )
-        out = _vision_flash_rows(
-            *(jnp.asarray(x.numpy()) for x in (q, k, v)),
-            *(jnp.asarray(x.numpy()) for x in rows),
-            sm_scale=scale,
-            attention=reference_attention,
-        )
+        # On the JAX CPU device, so the fp32 reference is exact on a TPU host too
+        # (TPU matmuls default to bf16 passes).
+        with jax.default_device(jax.devices("cpu")[0]):
+            out = _vision_flash_rows(
+                *(jnp.asarray(x.numpy()) for x in (q, k, v)),
+                *(jnp.asarray(x.numpy()) for x in rows),
+                sm_scale=scale,
+                attention=reference_attention,
+            )
         torch.testing.assert_close(
             torch.from_numpy(np.asarray(out)),
             _ref_token_attention(q, k, v, seg, scale),
