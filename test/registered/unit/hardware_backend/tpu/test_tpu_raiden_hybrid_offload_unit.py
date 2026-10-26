@@ -89,6 +89,7 @@ class _FakeEntry:
         self.host_pool = host_pool
         self.device_pool = device_pool
         self.device_indices_from_anchor_fn = None
+        self.packed_draft_device_pools = ()
 
 
 class _FakeGroup:
@@ -572,12 +573,13 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             mamba_allocator=SimpleNamespace(alloc=MagicMock(), free=MagicMock()),
         )
         kvcache = SimpleNamespace(
-            full_kv_pool=object(),
+            full_kv_pool=SimpleNamespace(layer_num=2),
             full_attention_layer_id_mapping={0: 0, 3: 1},
             start_layer=0,
         )
+        draft = object()
         params = SimpleNamespace(
-            mtp_draft_device_pools=(),
+            mtp_draft_device_pools=(draft,),
             req_to_token_pool=req_pool,
             page_size=128,
             token_to_kv_pool_allocator=object(),
@@ -591,7 +593,7 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             patch(
                 "sglang_tpu.kv_pool_host.tpu_dma_host_kv_pool_cls",
                 return_value=MagicMock(return_value=kv_host),
-            ),
+            ) as kv_host_cls,
             patch(
                 "sglang_tpu.kv_pool_host.tpu_dma_mamba_pool_host_cls",
                 return_value=MagicMock(return_value=state_host),
@@ -617,6 +619,15 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             set(result.host_pool_group.entry_map), {PoolName.KV, PoolName.MAMBA}
         )
         self.assertTrue(result.register_req_to_token_counter)
+        # MTP draft KV packs into the KV entry and its host pool, like upstream.
+        kv_entry = result.host_pool_group.entry_map[PoolName.KV]
+        self.assertEqual(kv_entry.packed_draft_device_pools, (draft,))
+        self.assertEqual(
+            kv_host_cls.return_value.call_args.kwargs["mtp_draft_device_pools"],
+            (draft,),
+        )
+        # Transfer layer 4 (after layers 0-3) is the draft, host layer 2.
+        self.assertEqual(kv_entry.layer_mapper(4), 2)
 
     def test_split_pool_host_sizing_matches_its_allocation(self):
         """A host page holds every DSA buffer of the page, so host bytes per token
@@ -631,7 +642,7 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
         self.assertEqual(len(tensors), 3 * 2 + 2 * 2)
         self.assertEqual({t.shape[0] for t in tensors}, {split.num_pages})
         host = object.__new__(TpuDMAHostKVPool)
-        host.device_pool, host.page_size = split, split.page_size
+        host.device_pool, host.page_size, host.draft_pools = split, split.page_size, ()
         self.assertEqual(
             host.get_size_per_token(),
             TpuSplitMLATokenToKVPool.bytes_per_token(

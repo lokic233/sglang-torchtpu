@@ -84,6 +84,11 @@ class TpuDMAHybridCacheController(HybridCacheController):
         # whole-batch ``wait()`` resolves against the reload event.
         self.layer_done_counter = BatchGateCounter()
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+        # A packed MTP draft pool's forward gates on its own counter; its pages
+        # land in the same engine call as the target's.
+        for entry in self.mem_pool_host.entries:
+            for draft_pool in entry.packed_draft_device_pools:
+                draft_pool.register_layer_transfer_counter(self.layer_done_counter)
 
     # ----- draft registration guards -----------------------------------------
 

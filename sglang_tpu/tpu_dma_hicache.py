@@ -99,13 +99,21 @@ def tpu_dma_hicache_backends() -> list[str]:
 
 
 def create_tpu_dma_kv_transfer(
-    io_backend: str, device_pool, num_host_pages: int
+    io_backend: str, device_pool, num_host_pages: int, *, draft_pools: tuple = ()
 ) -> TpuDMAKVTransfer:
-    """Build ``io_backend``'s engine; raises ``ValueError`` if it is not registered."""
+    """Build ``io_backend``'s engine; raises ``ValueError`` if it is not registered.
+
+    ``draft_pools`` are packed MTP draft pools on the target's page ids; an
+    engine that copies them takes them as ``factory(..., draft_pools=...)``.
+    """
     if io_backend not in _ENGINES:
         raise ValueError(
             f"--hicache-io-backend {io_backend!r} is not one of "
             f"{', '.join(sorted(_ENGINES))}"
+        )
+    if draft_pools:
+        return _ENGINES[io_backend](
+            device_pool, num_host_pages, draft_pools=draft_pools
         )
     return _ENGINES[io_backend](device_pool, num_host_pages)
 
@@ -144,12 +152,16 @@ class CombinedFutureEvent:
 _ENGINES: dict[str, Callable[[Any, int], TpuDMAKVTransfer]] = {}
 
 
-def _raiden(device_pool, num_host_pages: int) -> TpuDMAKVTransfer:
+def _raiden(
+    device_pool, num_host_pages: int, draft_pools: tuple = ()
+) -> TpuDMAKVTransfer:
     # Looked up per call, so tpu-sync loads only when a raiden engine is built
     # and tests can patch RaidenKVTransfer.
     from sglang_tpu import raiden_transfer
 
-    return raiden_transfer.RaidenKVTransfer(device_pool, num_host_pages)
+    return raiden_transfer.RaidenKVTransfer(
+        device_pool, num_host_pages, draft_pools=draft_pools
+    )
 
 
 register_tpu_dma_hicache_backend("raiden", _raiden)

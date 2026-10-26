@@ -54,6 +54,10 @@ class TpuDmaMambaStrategy(hybrid_pool_assembler.StackStrategy):
         model_name: Optional[str] = None,
         enable_storage_metrics: bool = False,
     ) -> hybrid_pool_assembler.StackBuildResult:
+        from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+            with_packed_draft_layer_mapping,
+        )
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
         from sglang_tpu.kv_pool_host import (
             tpu_dma_host_kv_pool_cls,
             tpu_dma_mamba_pool_host_cls,
@@ -62,7 +66,6 @@ class TpuDmaMambaStrategy(hybrid_pool_assembler.StackStrategy):
             TpuDMAHybridCacheController,
         )
 
-        assert not params.mtp_draft_device_pools, "packed MTP draft KV is not supported"
         memory = get_memory()
         io_backend = memory.hicache_io_backend
         kv_pool, mamba_pool = kvcache.full_kv_pool, params.req_to_token_pool.mamba_pool
@@ -75,6 +78,18 @@ class TpuDmaMambaStrategy(hybrid_pool_assembler.StackStrategy):
         transfer_layer_id_max = (
             max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
         )
+        # MTP draft KV is packed into the KV entry, as in the upstream mamba stack.
+        draft_pools = tuple(
+            pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+            for pool in params.mtp_draft_device_pools
+        )
+        if draft_pools:
+            full_layer_mapping = with_packed_draft_layer_mapping(
+                full_layer_mapping,
+                transfer_layer_start=transfer_layer_id_max,
+                target_device_layer_num=kv_pool.layer_num,
+                draft_layer_num=len(draft_pools),
+            )
         kv_host_size, mamba_host_size = memory.hicache_size, 0
         if memory.hicache_size > 0:
             kv_host_size, mamba_host_size = hybrid_pool_assembler._split_hicache_size(
@@ -86,6 +101,7 @@ class TpuDmaMambaStrategy(hybrid_pool_assembler.StackStrategy):
             kv_host_size,
             params.page_size,
             memory.hicache_mem_layout,
+            mtp_draft_device_pools=draft_pools,
         )
         mamba_host_pool = tpu_dma_mamba_pool_host_cls(io_backend)(
             mamba_pool, memory.hicache_ratio, mamba_host_size
@@ -98,8 +114,9 @@ class TpuDmaMambaStrategy(hybrid_pool_assembler.StackStrategy):
                     host_pool=kv_host_pool,
                     device_pool=kv_pool,
                     layer_mapping=full_layer_mapping,
-                    transfer_layer_id_max=transfer_layer_id_max,
+                    transfer_layer_id_max=transfer_layer_id_max + len(draft_pools),
                     is_anchor=True,
+                    packed_draft_device_pools=draft_pools,
                 ),
                 hybrid_pool_assembler.build_pool_entry(
                     name=PoolName.MAMBA,

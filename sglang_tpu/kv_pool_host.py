@@ -355,12 +355,10 @@ class TpuDMAHostKVPool(HostKVCache):
         # are, so the width comes from page_major_tensors.
         override_kv_cache_dim: Optional[int] = None,
     ):
-        if mtp_draft_device_pools:
-            raise NotImplementedError(
-                "MTP draft KV offload is not supported on --hicache-io-backend "
-                f"{self.io_backend}."
-            )
         del override_kv_cache_dim
+        # Packed MTP draft pools share the target's page ids, so one engine
+        # moves a page of the target and of every draft together.
+        self.draft_pools = tuple(mtp_draft_device_pools)
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
@@ -432,7 +430,7 @@ class TpuDMAHostKVPool(HostKVCache):
         )
 
         self.transfer = create_tpu_dma_kv_transfer(
-            self.io_backend, device_pool, self.page_num
+            self.io_backend, device_pool, self.page_num, draft_pools=self.draft_pools
         )
 
         self.lock = threading.RLock()
@@ -449,7 +447,11 @@ class TpuDMAHostKVPool(HostKVCache):
         the host_size GB budget matches the engine's actual per-page allocation,
         not the logical ``2 * head_num * head_dim`` lower bound.
         """
-        tensors = page_major_tensors(self.device_pool)
+        tensors = [
+            t
+            for pool in (self.device_pool, *self.draft_pools)
+            for t in page_major_tensors(pool)
+        ]
         page_bytes = sum(int(np.prod(t.shape[1:])) * t.element_size() for t in tensors)
         return page_bytes // self.page_size
 
@@ -591,6 +593,7 @@ class TpuDMAMambaPoolHost(TpuDMAHostKVPool):
     ):
         del allocator_type, layout
         self.num_mamba_layers = device_pool.num_mamba_layers
+        self.draft_pools = ()
         self._init_pages(
             device_pool,
             host_to_device_ratio=host_to_device_ratio,

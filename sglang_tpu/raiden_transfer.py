@@ -105,12 +105,21 @@ class RaidenKVTransfer:
         self,
         device_pool: TpuFusedMHATokenToKVPool,
         num_host_pages: int,
+        draft_pools: tuple = (),
     ):
         from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         self.device_pool = device_pool
         self.num_host_pages = num_host_pages
-        tensors = page_major_tensors(device_pool)
+        # Packed MTP draft pools ride the target's page ids, after its tensors.
+        tensors = [
+            t for pool in (device_pool, *draft_pools) for t in page_major_tensors(pool)
+        ]
+        if len({t.shape[0] for t in tensors}) != 1:
+            raise ValueError(
+                "Raiden HiCache needs every target and draft page tensor to hold "
+                f"the same number of pages; got {sorted({t.shape[0] for t in tensors})}"
+            )
         self.layer_num = len(tensors)
 
         # outer list = raiden "layer" (one per tensor), inner list = shard (one
