@@ -557,7 +557,8 @@ class TpuSplashAttentionBackend(SDPABackend):
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
-        return AttentionBackendEnum.TPU_SPLASH_ATTN
+        # The platform's own backend; TpuOOTPlatform names it tpu_splash_attn.
+        return AttentionBackendEnum.OOT
 
     @staticmethod
     def get_impl_cls() -> type["TpuSplashAttentionImpl"]:

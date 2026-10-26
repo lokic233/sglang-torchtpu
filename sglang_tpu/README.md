@@ -127,3 +127,22 @@ prepares patches. Live check:
 [`test_tpu_muse_spark_mm_pd_multihost.py`](../test/registered/tpu/e2e/test_tpu_muse_spark_mm_pd_multihost.py)
 (images and video over P/D), with `SGLANG_TPU_USE_LIVE_SERVER=1` and
 `BASE_URL` pointing at the router.
+
+## Diffusion (multimodal_gen)
+
+`multimodal_gen/` holds the diffusion TPU code. The `tpu_oot` entry point of
+`sglang.multimodal_gen.platforms` selects `multimodal_gen.platform.TpuOOTPlatform`
+whenever `torch.tpu` is registered; `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`
+selects the fork's built-in TPU platform instead. `TpuOOTPlatform` subclasses that
+built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and carries the
+TPU behavior (`--attention-backend tpu_splash_attn`, the `AttentionBackendEnum.OOT`
+backend).
+
+Gates that take the OOT arm, with the same outcome as the built-in platform:
+
+- `CustomOp` dispatch: the dispatch key is `tpu`, so ops reach `forward_tpu`
+  where they define it and `forward_native` otherwise.
+- `get_torch_library_dispatch_key()`: `PrivateUse1` instead of `CUDA`; its only
+  caller registers the CUDA flash-attention op, which TPU never selects.
+- `get_all_to_all_communicator_cls()`: answered explicitly with the base
+  communicator the built-in platform uses.
