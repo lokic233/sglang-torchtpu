@@ -10,6 +10,11 @@ rows and attends within a row only (``_get_vision_flash_rows_op``).
 
 ``_register_attention_backends`` installs it as the ``"tpu"`` vision attention
 backend; without ``rows=`` it is ``VisionTpuAttention`` unchanged.
+
+Callers that pass ``rows=`` must call this class directly. ``VisionAttention``
+does not forward ``rows=``, and a plain ``VisionTpuAttention`` (the default of
+other vision runners, or the ``"tpu"`` entry before registration) accepts it
+through ``**kwargs`` and ignores it, running full attention without an error.
 """
 
 from __future__ import annotations
@@ -31,9 +36,9 @@ class VisionAttentionRows(NamedTuple):
     Tokens of each short segment are gathered into rows of equal length, and
     attention runs within a row only.
 
-    row_index: [num_rows * row_len] int32, the token held by each row slot. Pad
-        slots must still hold a valid token index (e.g. 0): an out-of-range index
-        gathers NaN, which the additive mask does not remove.
+    row_index: [num_rows * row_len] int32, the token held by each row slot. A pad
+        slot may hold any index: the gather clamps it into range, and its segment
+        ID keeps it out of every real token's attention.
     row_segment_ids: [num_rows, row_len] int32, the segment of each slot. A query
         attends only to keys of its own segment in its row; pad slots use an ID
         that no segment in their row uses.
@@ -50,7 +55,11 @@ class VisionAttentionRows(NamedTuple):
 
 
 class VisionTpuRowsAttention(VisionTpuAttention):
-    """``VisionTpuAttention`` that also runs segment-local attention over rows."""
+    """``VisionTpuAttention`` that also runs segment-local attention over rows.
+
+    Call it directly with ``rows=``; see the module docstring for the paths that
+    would drop the layout silently.
+    """
 
     def __init__(self, head_dim, num_heads, num_kv_heads, **kwargs):
         super().__init__(head_dim, num_heads, num_kv_heads, **kwargs)
@@ -103,13 +112,13 @@ class VisionTpuRowsAttention(VisionTpuAttention):
                 f"{tuple(rows.row_segment_ids.shape)}, "
                 f"{tuple(rows.row_index.shape)} for seq_len {q.shape[0]}"
             )
+        # Same KV-head checks and expansion as the segment-id path.
+        if k.shape[1] != v.shape[1] or q.shape[1] % k.shape[1] != 0:
+            raise ValueError(
+                "TPU vision attention requires matching KV heads and an "
+                "integer query-to-KV head ratio"
+            )
         if k.shape[1] != q.shape[1]:
-            # Same KV-head expansion as the segment-id path.
-            if k.shape[1] != v.shape[1] or q.shape[1] % k.shape[1] != 0:
-                raise ValueError(
-                    "TPU vision attention requires matching KV heads and an "
-                    "integer query-to-KV head ratio"
-                )
             repeats = q.shape[1] // k.shape[1]
             k = k.repeat_interleave(repeats, dim=1)
             v = v.repeat_interleave(repeats, dim=1)

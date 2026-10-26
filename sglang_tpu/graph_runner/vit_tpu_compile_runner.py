@@ -105,6 +105,16 @@ def _cu_seqlens_to_segment_ids(
     return segment_ids.to(device=device, non_blocking=True)
 
 
+def _vision_specialization_key(*args) -> tuple:
+    """Direct-compile key for a vision boundary: shape and dtype of each input.
+
+    An optional input passed as None keys its own specialization, so a boundary
+    whose extra tensor is used only for some buckets (e.g. a rows layout for
+    segment-local attention) compiles once per variant instead of crashing.
+    """
+    return tuple(None if t is None else (tuple(t.shape), t.dtype) for t in args)
+
+
 @dataclass(frozen=True)
 class VisionPaddingContext:
     real_seq_len: int
@@ -221,10 +231,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
                     torch.no_grad()(method),
                     name=self.name,
                     spmd_safe=self.spmd_safe,
-                    # An optional input (None) keys its own specialization.
-                    specialization_key=lambda *args: tuple(
-                        None if t is None else (tuple(t.shape), t.dtype) for t in args
-                    ),
+                    specialization_key=_vision_specialization_key,
                     model=model,
                     lift_rank=(
                         torch.distributed.is_initialized()

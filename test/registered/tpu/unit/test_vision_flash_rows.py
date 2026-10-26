@@ -48,7 +48,11 @@ def _ref_rows_attention(q, k, v, row_index, row_segment_ids, inverse_index, scal
     """Torch reference for the rows op: gather, per-row segment attention, gather back."""
     num_rows = row_segment_ids.shape[0]
     rows = [
-        rearrange(x[row_index.long()], "(r l) h d -> r h l d", r=num_rows)
+        rearrange(
+            x[row_index.long().clamp(0, x.shape[0] - 1)],
+            "(r l) h d -> r h l d",
+            r=num_rows,
+        )
         for x in (q, k, v)
     ]
     out = _ref_segment_attention(*rows, row_segment_ids, scale).to(q.dtype)
@@ -184,11 +188,18 @@ class TestVisionTpuRowsAttentionCpu(CustomTestCase):
                 with self.assertRaises(ValueError):
                     attn.forward(x, x, x, bsz=1, rows=bad)
 
+    def test_rejects_v_heads_unlike_k(self):
+        attn = _CpuRowsAttn(16, 2, 2, 0.25)
+        q = torch.randn(128, 2, 16)
+        rows = _rows_layout(torch.zeros(128, dtype=torch.int32), 128)
+        with self.assertRaises(ValueError):
+            attn.forward(q, q, torch.randn(128, 1, 16), bsz=1, rows=rows)
+
 
 class TestVisionFlashRowsJax(CustomTestCase):
     """The op's JAX body, with the Pallas kernel swapped for the JAX reference attention."""
 
-    def _check(self, seg, row_len, h, d, seed):
+    def _check(self, seg, row_len, h, d, seed, pad_index=0):
         import jax.numpy as jnp
         import numpy as np
 
@@ -203,9 +214,16 @@ class TestVisionFlashRowsJax(CustomTestCase):
         torch.manual_seed(seed)
         scale = 1.0 / math.sqrt(d)
         q, k, v = (torch.randn(seg.shape[0], h, d) for _ in range(3))
+        rows = _rows_layout(seg, row_len)
+        pads = rows.row_segment_ids.flatten() == -1
+        rows = rows._replace(
+            row_index=torch.where(
+                pads, torch.tensor(pad_index, dtype=torch.int32), rows.row_index
+            )
+        )
         out = _vision_flash_rows(
             *(jnp.asarray(x.numpy()) for x in (q, k, v)),
-            *(jnp.asarray(x.numpy()) for x in _rows_layout(seg, row_len)),
+            *(jnp.asarray(x.numpy()) for x in rows),
             sm_scale=scale,
             attention=reference_attention,
         )
@@ -221,6 +239,13 @@ class TestVisionFlashRowsJax(CustomTestCase):
 
     def test_interleaved_segments(self):
         self._check(_tiles(32, 32, 8, 16), row_len=256, h=2, d=16, seed=1)
+
+    def test_out_of_range_pad_indices_are_clamped(self):
+        # Pad slots pointing past either end gather a clamped token, not NaN.
+        seg = _segments([100, 20, 60, 128, 7, 1])
+        for pad_index in (seg.shape[0], 1 << 20, -5):
+            with self.subTest(pad_index=pad_index):
+                self._check(seg, row_len=128, h=2, d=16, seed=4, pad_index=pad_index)
 
 
 def _tpu_available() -> bool:

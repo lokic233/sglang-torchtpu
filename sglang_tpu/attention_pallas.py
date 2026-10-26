@@ -539,7 +539,9 @@ def _vision_flash_rows(
     _, num_heads, head_dim = q.shape
 
     def to_rows(x):
-        x = jnp.take(x, row_index, axis=0)
+        # Pad slots may hold any index; clamping keeps their gather finite (the
+        # default fill is NaN, which the kernel's additive mask would not remove).
+        x = jnp.take(x, row_index, axis=0, mode="clip")
         return x.reshape(num_rows, row_len, num_heads, head_dim).transpose(0, 2, 1, 3)
 
     out = attention(
