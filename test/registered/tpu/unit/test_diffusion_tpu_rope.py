@@ -8,10 +8,13 @@ import torch
 
 from sglang.kernels.ops.diffusion.common.fallback_torch import (
     apply_rotary_embedding_native,
-    apply_rotary_embedding_pair_swap,
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.utils import is_in_ci
+from sglang_tpu.multimodal_gen.rope import (
+    _build_pair_swap_matrix,
+    apply_rotary_embedding_pair_swap,
+)
 
 register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -53,10 +56,6 @@ class TestRopePairSwapTpu(unittest.TestCase):
     def test_bf16_compiled_matches_compiled_strided_form(self):
         # XLA may fuse the two forms differently under torch.compile.
         import torch_tpu._internal.compile  # noqa: F401
-
-        from sglang.kernels.ops.diffusion.common.fallback_torch import (
-            _build_pair_swap_matrix,
-        )
 
         torch.manual_seed(0)
         head_dim = 128

@@ -45,13 +45,6 @@ def _memory_stat(key: str) -> int:
     return int(torch.accelerator.memory_stats().get(key, 0))
 
 
-def _tpu_plugin():
-    """The plugin's worker hooks: this platform's one import of sglang_tpu."""
-    from sglang_tpu.multimodal_gen import worker
-
-    return worker
-
-
 def _install_device_module_shims() -> None:
     for name, fn in _DEVICE_MODULE_SHIMS.items():
         if not hasattr(torch.tpu, name):
@@ -168,7 +161,10 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _init_worker_process(cls) -> None:
-        plugin = _tpu_plugin()
+        from sglang_tpu.patches import (
+            _patch_set_device_tolerate_mismatch,
+            _prepare_tpu_env,
+        )
 
         # srt's activate() selects CPU-only JAX for TorchTPU processes; the
         # worker cannot rely on that having run in the parent (entry-point
@@ -179,43 +175,21 @@ class TpuPlatform(Platform):
         os.environ.setdefault(
             "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
         )
-        plugin.prepare_env(_world_size())
+        _prepare_tpu_env(world_size=_world_size(), resolve_single_host_topology=True)
         import torch_tpu  # noqa: F401
 
         # Registers the "tpu" dynamo backend that simple_compile_backend names.
         import torch_tpu._internal.compile  # noqa: F401
 
-        plugin.install_runtime_patches()
+        # PJRT owns the chiplet binding; local_rank is only a label.
+        _patch_set_device_tolerate_mismatch()
 
         _install_device_module_shims()
         torch.zeros(1, device="tpu")
 
-    def configure_compile_cache(self) -> None:
-        # torch_tpu persists XLA executables in AOTAutogradCache, whose key sees
-        # neither the device assignment behind collectives, opaque Pallas kernel
-        # sources nor the XLA flags: a stale hit can hang or ignore new flags.
-        _tpu_plugin().configure_compile_cache()
-
     def get_torch_distributed_backend_str(self) -> str:
         # tpu_dist needs one addressable PJRT device; a lone worker has many.
         return "gloo" if _world_size() == 1 else "tpu_dist"
-
-    def apply_server_args_defaults(self, server_args) -> None:
-        # The compile warmup layerwise-offloads the DiT, which TPU cannot run.
-        if (
-            server_args.is_arg_explicitly_set("offload_during_compile")
-            and server_args.offload_during_compile
-        ):
-            logger.warning(
-                "--offload-during-compile is not supported on TPU (the compile "
-                "warmup cannot layerwise-offload the DiT); disabling it."
-            )
-        server_args.offload_during_compile = False
-
-    def supports_teacache_with_torch_compile(self) -> bool:
-        # Every TeaCache state update is a full XLA recompile under the
-        # torch_tpu backend, up to the recompile limit.
-        return False
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -234,14 +208,6 @@ class TpuPlatform(Platform):
             f"Attention backend {selected_backend} is not supported on TPU; "
             "the supported backend is TORCH_SDPA (default)."
         )
-
-    @classmethod
-    def supports_vae_torch_compile(cls) -> bool:
-        # Off for every VAE: the torch_tpu backend fails to compile the diffusers
-        # AutoencoderKL decoder (torch_tpu 0.2.0rc4, libtpu 0.0.50: view() cannot
-        # turn a channels-last [1, 512, 128, 128] activation into [1, 32, 262144]),
-        # and the other VAEs are untested under it.
-        return False
 
     @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:

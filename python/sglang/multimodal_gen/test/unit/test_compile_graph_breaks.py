@@ -17,9 +17,6 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.torch_compile import (
-    build_torch_compile_kwargs,
-)
 
 
 def _compile(fn):
@@ -87,7 +84,7 @@ class TestDenoisingStepTimestep(unittest.TestCase):
             state = stage._prepare_step_state(
                 ctx, None, None, step_index, t_host, timesteps
             )
-            # torch_tpu keys compiled executables on the storage offset.
+            # A backend may key compiled executables on the storage offset.
             self.assertEqual(state.t_device.storage_offset(), 0)
             self.assertNotEqual(
                 state.t_device.untyped_storage().data_ptr(),
@@ -272,32 +269,8 @@ class TestWanStepCounter(unittest.TestCase):
                 self.assertEqual(model.cnt, expected)
 
 
-class TestTpuCompileKwargs(unittest.TestCase):
-    """What the TPU platform compiles, and with which arguments."""
-
-    def test_tpu_compiles_static_shapes_with_platform_backend(self):
-        compile_path = "sglang.multimodal_gen.runtime.utils.torch_compile"
-        with (
-            patch(
-                f"{compile_path}.current_platform.is_out_of_tree",
-                return_value=False,
-            ),
-            patch(f"{compile_path}.current_platform.is_tpu", return_value=True),
-            patch(
-                f"{compile_path}.current_platform.get_compile_backend",
-                return_value="tpu",
-            ) as get_compile_backend,
-        ):
-            compile_kwargs = build_torch_compile_kwargs(
-                mode="max-autotune-no-cudagraphs",
-                module=torch.nn.Module(),
-                enable_inductor_compute_comm_overlap=True,
-            )
-
-        self.assertEqual(
-            compile_kwargs, {"backend": "tpu", "dynamic": False, "fullgraph": False}
-        )
-        get_compile_backend.assert_called_once_with("max-autotune-no-cudagraphs")
+class TestPlatformCompileGates(unittest.TestCase):
+    """What a platform lets --enable-torch-compile compile."""
 
     def test_vae_decode_stays_eager_where_the_platform_cannot_compile_it(self):
         stage = DecodingStage.__new__(DecodingStage)
@@ -318,6 +291,26 @@ class TestTpuCompileKwargs(unittest.TestCase):
 
         self.assertIs(result, decode)
         compiled_callable.get_or_compile.assert_not_called()
+
+    def test_teacache_is_dropped_where_the_platform_recompiles_on_it(self):
+        for supported, compile_on, expected in (
+            (False, True, False),
+            (False, False, True),
+            (True, True, True),
+        ):
+            with (
+                self.subTest(supported=supported, enable_torch_compile=compile_on),
+                patch.object(
+                    current_platform,
+                    "supports_teacache_with_torch_compile",
+                    return_value=supported,
+                ),
+            ):
+                params = SamplingParams(enable_teacache=True)
+                params._drop_teacache_if_it_recompiles(
+                    SimpleNamespace(enable_torch_compile=compile_on)
+                )
+                self.assertEqual(params.enable_teacache, expected)
 
 
 if __name__ == "__main__":

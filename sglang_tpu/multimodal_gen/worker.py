@@ -1,24 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TPU hooks of a multimodal_gen worker.
-
-The diffusion TPU platform (``sglang.multimodal_gen.runtime.platforms.tpu``)
-reaches the plugin through this module only.
-"""
-
-
-def prepare_env(world_size: int) -> None:
-    """Set the TPU env of a worker; call before ``torch_tpu`` is imported."""
-    from sglang_tpu.patches import _prepare_tpu_env
-
-    _prepare_tpu_env(world_size=world_size, resolve_single_host_topology=True)
+"""Worker-side steps of the diffusion TPU platform (``TpuOOTPlatform``)."""
 
 
 def install_runtime_patches() -> None:
-    """Patch ``torch_tpu`` for a worker; call after it is imported."""
-    from sglang_tpu.patches import _patch_set_device_tolerate_mismatch
+    """Patch a worker; call after ``torch_tpu`` is imported."""
+    from sglang_tpu.multimodal_gen import rope
 
-    # PJRT owns the chiplet binding; local_rank is only a label.
-    _patch_set_device_tolerate_mismatch()
+    rope.install()
 
 
 def configure_compile_cache() -> None:

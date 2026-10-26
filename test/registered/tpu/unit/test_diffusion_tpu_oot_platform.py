@@ -118,5 +118,76 @@ class TestSplashBackend(CustomTestCase):
                 normalize("tpu_splash_attn")
 
 
+class TestCompileDefaults(CustomTestCase):
+    def test_compile_warmup_keeps_the_dit_resident(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.base import (
+            PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        def server_args(**kwargs):
+            # ServerArgs.__post_init__ applies the platform defaults.
+            with (
+                patch.object(
+                    PipelineConfig, "from_kwargs", return_value=PipelineConfig()
+                ),
+                patch.object(
+                    current_platform,
+                    "apply_server_args_defaults",
+                    TpuOOTPlatform().apply_server_args_defaults,
+                ),
+            ):
+                return server_args_module.ServerArgs.from_kwargs(
+                    model_path="/fake", **kwargs
+                )
+
+        self.assertFalse(server_args().offload_during_compile)
+        # An explicit request is overridden: the warmup offload crashes on TPU.
+        self.assertFalse(
+            server_args(offload_during_compile=True).offload_during_compile
+        )
+
+    def test_teacache_is_dropped_under_torch_compile(self):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        self.assertFalse(TpuOOTPlatform().supports_teacache_with_torch_compile())
+        for compile_on, expected in ((True, False), (False, True)):
+            with (
+                self.subTest(enable_torch_compile=compile_on),
+                patch.object(
+                    current_platform,
+                    "supports_teacache_with_torch_compile",
+                    TpuOOTPlatform().supports_teacache_with_torch_compile,
+                ),
+            ):
+                params = SamplingParams(enable_teacache=True)
+                params._drop_teacache_if_it_recompiles(
+                    SimpleNamespace(enable_torch_compile=compile_on)
+                )
+                self.assertEqual(params.enable_teacache, expected)
+
+    def test_vae_decode_stays_eager(self):
+        self.assertFalse(TpuOOTPlatform.supports_vae_torch_compile())
+
+    def test_worker_init_keeps_recompiles_static_and_patches_the_worker(self):
+        import torch._dynamo
+
+        from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
+        from sglang_tpu.multimodal_gen import worker
+
+        with (
+            torch._dynamo.config.patch(automatic_dynamic_shapes=True),
+            patch.object(TpuPlatform, "_init_worker_process") as base_init,
+            patch.object(worker, "install_runtime_patches") as install,
+        ):
+            TpuOOTPlatform._init_worker_process()
+            self.assertFalse(torch._dynamo.config.automatic_dynamic_shapes)
+        base_init.assert_called_once_with()
+        install.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

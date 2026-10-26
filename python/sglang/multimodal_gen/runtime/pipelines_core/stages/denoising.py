@@ -562,8 +562,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         if current_platform.is_npu():
             logger.info("Compiling transformer with torchair backend on NPU")
-        elif current_platform.is_tpu():
-            logger.info("Compiling transformer with the torch_tpu backend")
         else:
             logger.info(f"Compiling transformer with mode: {mode}")
 
@@ -1569,8 +1567,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ) -> DenoisingStepState:
         """Build the per-step state shared by the loop and model-specific hooks."""
         t_int = int(t_host.item())
-        # A view of the schedule carries a step-dependent storage offset, which
-        # torch_tpu's compiled-executable key includes: each step would recompile.
+        # A view of the schedule carries a step-dependent storage offset; a
+        # backend that keys compiled executables on it would recompile each step.
         t_device = ctx.timesteps[step_index].clone()
         current_model, current_guidance_scale = self._select_and_manage_model(
             t_int=t_int,
